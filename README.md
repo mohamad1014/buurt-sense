@@ -171,7 +171,10 @@ cd buurt-sense
 
 # (Option A) Install backend deps
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt  # (file to be added)
+pip install -r requirements.txt
+
+# Run the minimal FastAPI service
+uvicorn backend.main:app --reload
 
 # (Option B) Frontend
 npm install  # after package.json added
@@ -194,13 +197,38 @@ npm install  # after package.json added
 - Model sanity: sample clips produce expected class probabilities.
 - Future: confusion matrix generation, performance benchmarks on low-end devices.
 
-## 18. Contribution
+### Running Tests
+
+```bash
+pytest
+```
+
+The suite exercises the FastAPI session endpoints end-to-end, covering happy-path start/stop flows and error scenarios such as
+unknown or double-stopped sessions.
+
+## 18. Code Style & Tooling
+
+Python source in this repository is formatted with [Black](https://black.readthedocs.io/) and linted with [Ruff](https://docs.astral.sh/ruff/). Run them locally before opening a pull request:
+
+```
+black backend tests
+ruff check backend tests
+```
+
+Convenience targets are available via `make`:
+
+```
+make format
+make lint
+```
+
+## 19. Contribution
 Not open for external contributions at MVP; will define guidelines (linting, conventional commits, test coverage) later.
 
-## 19. License
+## 20. License
 MIT License (see `LICENSE`).
 
-## 20. Outstanding Questions (Need Clarification)
+## 21. Outstanding Questions (Need Clarification)
 1. Max adjustable segment length range (current default 30s; propose 10–60s?) & overlap configurability.
 2. Local encryption of stored segments (implement now or defer Phase 1?).
 3. Retention policy (none vs purge after X days vs user selectable?).
@@ -212,7 +240,7 @@ MIT License (see `LICENSE`).
 9. Future distribution: remain simple Python or add Docker earlier?
 10. Minimum device spec baseline (proposed mid-tier Android 2022+, 2GB RAM) – confirm.
 
-## 21. Disclaimer (Draft)
+## 22. Disclaimer (Draft)
 Buurt Sense is an assistive awareness tool and does not replace contacting emergency services. Accuracy of detections is probabilistic; users should exercise judgment.
 
 ---
