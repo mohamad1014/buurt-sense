@@ -171,7 +171,10 @@ cd buurt-sense
 
 # (Option A) Install backend deps
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt  # (file to be added)
+pip install -r requirements.txt
+
+# Run the minimal FastAPI service
+uvicorn backend.main:app --reload
 
 # (Option B) Frontend
 npm install  # after package.json added
