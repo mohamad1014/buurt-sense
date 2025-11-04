@@ -197,6 +197,15 @@ npm install  # after package.json added
 - Model sanity: sample clips produce expected class probabilities.
 - Future: confusion matrix generation, performance benchmarks on low-end devices.
 
+### Running Tests
+
+```bash
+pytest
+```
+
+The suite exercises the FastAPI session endpoints end-to-end, covering happy-path start/stop flows and error scenarios such as
+unknown or double-stopped sessions.
+
 ## 18. Code Style & Tooling
 
 Python source in this repository is formatted with [Black](https://black.readthedocs.io/) and linted with [Ruff](https://docs.astral.sh/ruff/). Run them locally before opening a pull request:
