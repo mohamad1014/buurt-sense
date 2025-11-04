@@ -194,6 +194,15 @@ npm install  # after package.json added
 - Model sanity: sample clips produce expected class probabilities.
 - Future: confusion matrix generation, performance benchmarks on low-end devices.
 
+### Running Tests
+
+```bash
+pytest
+```
+
+The suite exercises the FastAPI session endpoints end-to-end, covering happy-path start/stop flows and error scenarios such as
+unknown or double-stopped sessions.
+
 ## 18. Contribution
 Not open for external contributions at MVP; will define guidelines (linting, conventional commits, test coverage) later.
 
