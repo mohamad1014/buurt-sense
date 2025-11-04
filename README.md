@@ -158,6 +158,11 @@ Phase 1: Basic auth, background recording, privacy features (face blur, voice da
 Phase 2: Cloud sync, shared neighbourhood dashboards, alert distribution to trusted circle.
 Phase 3: Advanced analytics (heatmaps, temporal trends, predictive modeling), model feedback & retraining pipeline.
 
+### Near-Term Backend Roadmap
+- **Imminent validation**: flesh out backend unit and integration tests that cover session lifecycle endpoints and health reporting.
+- **Upcoming refactor**: extract a storage abstraction layer to support swapping local development storage for cloud backends without touching route logic.
+- **Future persistence**: design durable session archival (object storage + metadata DB) once on-device retention limits are defined.
+
 ## 15. Installation (Draft Placeholder)
 Prerequisites:
 - Python >= 3.11 (if choosing Python backend route)
@@ -177,7 +182,60 @@ pip install -r requirements.txt  # (file to be added)
 npm install  # after package.json added
 ```
 
-## 16. Development Tasks (Next)
+## 16. Backend Quickstart
+Follow these steps to get the FastAPI backend running locally.
+
+### 1. Create and Activate a Virtual Environment
+```bash
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
+```
+
+### 2. Install Dependencies
+```bash
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### 3. Launch the Development Server
+```bash
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+### 4. Exercise the API
+Use HTTPie or curl to interact with core endpoints once the server is running.
+
+#### Health Check (`GET /health`)
+```bash
+http GET :8000/health
+# or
+curl -X GET http://localhost:8000/health
+```
+
+#### Start a Session (`POST /sessions`)
+```bash
+http POST :8000/sessions device_id="demo-device" gps_origin:='{"lat":52.36,"lon":4.88}'
+# or
+curl -X POST http://localhost:8000/sessions \
+  -H "Content-Type: application/json" \
+  -d '{"device_id":"demo-device","gps_origin":{"lat":52.36,"lon":4.88}}'
+```
+
+#### Stop a Session (`POST /sessions/{session_id}/stop`)
+```bash
+http POST :8000/sessions/{session_id}/stop
+# or
+curl -X POST http://localhost:8000/sessions/{session_id}/stop
+```
+
+#### Retrieve Session Data (`GET /sessions/{session_id}`)
+```bash
+http GET :8000/sessions/{session_id}
+# or
+curl -X GET http://localhost:8000/sessions/{session_id}
+```
+
+## 17. Development Tasks (Next)
 - Implement Python FastAPI inference service skeleton.
 - Integrate React PWA media capture (video+audio) + segmentation (30s w/5s overlap).
 - Frame & audio sampling pipeline (every 2nd frame, sliding audio window).
@@ -188,19 +246,19 @@ npm install  # after package.json added
 - GPS + orientation capture integration.
 - Logging format for Detection records (JSON schema).
 
-## 17. Testing Strategy (Planned)
+## 18. Testing Strategy (Planned)
 - Unit: segmentation logic, threshold filtering.
 - Integration: end-to-end mock session -> stored detections.
 - Model sanity: sample clips produce expected class probabilities.
 - Future: confusion matrix generation, performance benchmarks on low-end devices.
 
-## 18. Contribution
+## 19. Contribution
 Not open for external contributions at MVP; will define guidelines (linting, conventional commits, test coverage) later.
 
-## 19. License
+## 20. License
 MIT License (see `LICENSE`).
 
-## 20. Outstanding Questions (Need Clarification)
+## 21. Outstanding Questions (Need Clarification)
 1. Max adjustable segment length range (current default 30s; propose 10–60s?) & overlap configurability.
 2. Local encryption of stored segments (implement now or defer Phase 1?).
 3. Retention policy (none vs purge after X days vs user selectable?).
@@ -212,7 +270,7 @@ MIT License (see `LICENSE`).
 9. Future distribution: remain simple Python or add Docker earlier?
 10. Minimum device spec baseline (proposed mid-tier Android 2022+, 2GB RAM) – confirm.
 
-## 21. Disclaimer (Draft)
+## 22. Disclaimer (Draft)
 Buurt Sense is an assistive awareness tool and does not replace contacting emergency services. Accuracy of detections is probabilistic; users should exercise judgment.
 
 ---
