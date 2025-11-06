@@ -2,6 +2,36 @@
 
 AI-powered neighbourhood awareness platform. Empowers communities to record and analyze surroundings in real time — detecting incidents like fights, robberies, fireworks, gunshots, screams, glass breaks, and vehicle crashes through lightweight on-device intelligence with instant local alerts.
 
+## Current Code Status
+
+- ✅ **FastAPI backend skeleton** with endpoints to create, stop, retrieve, and list recording sessions backed by an in-memory store (`app/main.py`, `app/storage.py`).
+- ✅ **Browser control panel** to start/stop sessions and view history, served at the root path (`app/frontend`).
+- ✅ **Pydantic session model** that enforces timezone-aware timestamps (`app/models.py`).
+- ✅ **Comprehensive pytest suite** covering the session lifecycle and error handling (`tests/test_sessions.py`).
+- ⚠️ **No production persistence or frontend yet**—all data is lost when the process stops, and the roadmap items below remain planned work.
+
+## Running the Local API
+
+The FastAPI service is created via an application factory called `create_app`. When running the development server, make sure to reference the callable instead of a module-level `app` (which is why `uvicorn app.main:app` fails).
+
+```bash
+uvicorn --factory app.main:create_app --reload --host 0.0.0.0 --port 8000
+```
+
+### Interactive Docs
+
+Once the server is running, visit `http://localhost:8000/` for the recording control panel or `http://localhost:8000/docs` for the automatically generated Swagger UI.
+
+## Running Tests
+
+Install dependencies and execute the pytest suite to validate the API behaviour:
+
+```bash
+pip install -r requirements.txt
+pytest
+```
+
+
 ## 1. Mission & Vision
 Buurt Sense is a civic and community-focused safety tool for Dutch neighbourhoods (initial launch scope: Netherlands). It helps residents, watch volunteers, and local authorities capture contextual evidence and increase situational awareness in areas where traditional reporting is slow or incomplete.
 
@@ -158,6 +188,11 @@ Phase 1: Basic auth, background recording, privacy features (face blur, voice da
 Phase 2: Cloud sync, shared neighbourhood dashboards, alert distribution to trusted circle.
 Phase 3: Advanced analytics (heatmaps, temporal trends, predictive modeling), model feedback & retraining pipeline.
 
+### Near-Term Backend Roadmap
+- **Imminent validation**: flesh out backend unit and integration tests that cover session lifecycle endpoints and health reporting.
+- **Upcoming refactor**: extract a storage abstraction layer to support swapping local development storage for cloud backends without touching route logic.
+- **Future persistence**: design durable session archival (object storage + metadata DB) once on-device retention limits are defined.
+
 ## 15. Installation (Draft Placeholder)
 Prerequisites:
 - Python >= 3.11 (if choosing Python backend route)
@@ -171,13 +206,69 @@ cd buurt-sense
 
 # (Option A) Install backend deps
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt  # (file to be added)
+pip install -r requirements.txt
+
+# Run the minimal FastAPI service
+uvicorn backend.main:app --reload
 
 # (Option B) Frontend
 npm install  # after package.json added
 ```
 
-## 16. Development Tasks (Next)
+## 16. Backend Quickstart
+Follow these steps to get the FastAPI backend running locally.
+
+### 1. Create and Activate a Virtual Environment
+```bash
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
+```
+
+### 2. Install Dependencies
+```bash
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### 3. Launch the Development Server
+```bash
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+### 4. Exercise the API
+Use HTTPie or curl to interact with core endpoints once the server is running.
+
+#### Health Check (`GET /health`)
+```bash
+http GET :8000/health
+# or
+curl -X GET http://localhost:8000/health
+```
+
+#### Start a Session (`POST /sessions`)
+```bash
+http POST :8000/sessions device_id="demo-device" gps_origin:='{"lat":52.36,"lon":4.88}'
+# or
+curl -X POST http://localhost:8000/sessions \
+  -H "Content-Type: application/json" \
+  -d '{"device_id":"demo-device","gps_origin":{"lat":52.36,"lon":4.88}}'
+```
+
+#### Stop a Session (`POST /sessions/{session_id}/stop`)
+```bash
+http POST :8000/sessions/{session_id}/stop
+# or
+curl -X POST http://localhost:8000/sessions/{session_id}/stop
+```
+
+#### Retrieve Session Data (`GET /sessions/{session_id}`)
+```bash
+http GET :8000/sessions/{session_id}
+# or
+curl -X GET http://localhost:8000/sessions/{session_id}
+```
+
+## 17. Development Tasks (Next)
 - Implement Python FastAPI inference service skeleton.
 - Integrate React PWA media capture (video+audio) + segmentation (30s w/5s overlap).
 - Frame & audio sampling pipeline (every 2nd frame, sliding audio window).
@@ -188,19 +279,44 @@ npm install  # after package.json added
 - GPS + orientation capture integration.
 - Logging format for Detection records (JSON schema).
 
-## 17. Testing Strategy (Planned)
+## 18. Testing Strategy (Planned)
 - Unit: segmentation logic, threshold filtering.
 - Integration: end-to-end mock session -> stored detections.
 - Model sanity: sample clips produce expected class probabilities.
 - Future: confusion matrix generation, performance benchmarks on low-end devices.
 
-## 18. Contribution
+### Running Tests
+
+```bash
+pytest
+```
+
+The suite exercises the FastAPI session endpoints end-to-end, covering happy-path start/stop flows and error scenarios such as
+unknown or double-stopped sessions.
+
+## 19. Code Style & Tooling
+
+Python source in this repository is formatted with [Black](https://black.readthedocs.io/) and linted with [Ruff](https://docs.astral.sh/ruff/). Run them locally before opening a pull request:
+
+```
+black backend tests
+ruff check backend tests
+```
+
+Convenience targets are available via `make`:
+
+```
+make format
+make lint
+```
+
+## 20. Contribution
 Not open for external contributions at MVP; will define guidelines (linting, conventional commits, test coverage) later.
 
-## 19. License
+## 21. License
 MIT License (see `LICENSE`).
 
-## 20. Outstanding Questions (Need Clarification)
+## 22. Outstanding Questions (Need Clarification)
 1. Max adjustable segment length range (current default 30s; propose 10–60s?) & overlap configurability.
 2. Local encryption of stored segments (implement now or defer Phase 1?).
 3. Retention policy (none vs purge after X days vs user selectable?).
@@ -212,7 +328,7 @@ MIT License (see `LICENSE`).
 9. Future distribution: remain simple Python or add Docker earlier?
 10. Minimum device spec baseline (proposed mid-tier Android 2022+, 2GB RAM) – confirm.
 
-## 21. Disclaimer (Draft)
+## 23. Disclaimer (Draft)
 Buurt Sense is an assistive awareness tool and does not replace contacting emergency services. Accuracy of detections is probabilistic; users should exercise judgment.
 
 ---

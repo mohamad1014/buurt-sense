@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Buurt Sense MVP</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="page-header">
+      <h1>Buurt Sense MVP Control Panel</h1>
+      <p class="tagline">Start and monitor local recording sessions from your browser.</p>
+    </header>
+
+    <main class="layout">
+      <section class="panel" aria-labelledby="controls-title">
+        <div class="panel-header">
+          <h2 id="controls-title">Session Controls</h2>
+        </div>
+        <div class="panel-body">
+          <div class="button-row">
+            <button id="start-session" type="button" class="primary">Start session</button>
+            <button id="stop-session" type="button" class="danger" disabled>Stop session</button>
+          </div>
+          <p id="status-message" role="status" aria-live="polite" class="status">
+            Ready to start a new session.
+          </p>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="active-session-title">
+        <div class="panel-header">
+          <h2 id="active-session-title">Active session</h2>
+        </div>
+        <div class="panel-body">
+          <dl class="session-details" id="active-session-details">
+            <dt>Status</dt>
+            <dd>No session running</dd>
+          </dl>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="session-log-title">
+        <div class="panel-header">
+          <h2 id="session-log-title">Session history</h2>
+          <button id="refresh-sessions" type="button" class="ghost">Refresh</button>
+        </div>
+        <div class="panel-body">
+          <ul id="session-list" class="session-list" aria-live="polite"></ul>
+        </div>
+      </section>
+    </main>
+
+    <footer class="page-footer">
+      <p>
+        All processing happens locally. This MVP stores session metadata only in memory and resets when the server restarts.
+      </p>
+    </footer>
+
+    <noscript>
+      <p class="noscript">JavaScript is required to control recording sessions.</p>
+    </noscript>
+
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
