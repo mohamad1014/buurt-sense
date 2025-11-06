@@ -2,6 +2,36 @@
 
 AI-powered neighbourhood awareness platform. Empowers communities to record and analyze surroundings in real time — detecting incidents like fights, robberies, fireworks, gunshots, screams, glass breaks, and vehicle crashes through lightweight on-device intelligence with instant local alerts.
 
+## Current Code Status
+
+- ✅ **FastAPI backend skeleton** with endpoints to create, stop, retrieve, and list recording sessions backed by an in-memory store (`app/main.py`, `app/storage.py`).
+- ✅ **Browser control panel** to start/stop sessions and view history, served at the root path (`app/frontend`).
+- ✅ **Pydantic session model** that enforces timezone-aware timestamps (`app/models.py`).
+- ✅ **Comprehensive pytest suite** covering the session lifecycle and error handling (`tests/test_sessions.py`).
+- ⚠️ **No production persistence or frontend yet**—all data is lost when the process stops, and the roadmap items below remain planned work.
+
+## Running the Local API
+
+The FastAPI service is created via an application factory called `create_app`. When running the development server, make sure to reference the callable instead of a module-level `app` (which is why `uvicorn app.main:app` fails).
+
+```bash
+uvicorn app.main:create_app --reload --host 0.0.0.0 --port 8000
+```
+
+### Interactive Docs
+
+Once the server is running, visit `http://localhost:8000/` for the recording control panel or `http://localhost:8000/docs` for the automatically generated Swagger UI.
+
+## Running Tests
+
+Install dependencies and execute the pytest suite to validate the API behaviour:
+
+```bash
+pip install -r requirements.txt
+pytest
+```
+
+
 ## 1. Mission & Vision
 Buurt Sense is a civic and community-focused safety tool for Dutch neighbourhoods (initial launch scope: Netherlands). It helps residents, watch volunteers, and local authorities capture contextual evidence and increase situational awareness in areas where traditional reporting is slow or incomplete.
 

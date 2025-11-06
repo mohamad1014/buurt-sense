@@ -11,9 +11,17 @@ from .app import AppResponse, FastAPI
 class Response:
     status_code: int
     _body: Any
+    media_type: str
+    headers: MutableMapping[str, str]
 
     def json(self) -> Any:
         return self._body
+
+    @property
+    def text(self) -> str:
+        if isinstance(self._body, str):
+            return self._body
+        return str(self._body)
 
 
 class TestClient:
@@ -39,4 +47,11 @@ class TestClient:
 
     def _request(self, method: str, path: str, body: Optional[MutableMapping[str, Any]] = None) -> Response:
         app_response: AppResponse = self.app.handle_request(method, path, body)
-        return Response(status_code=app_response.status_code, _body=app_response.body)
+        headers: MutableMapping[str, str] = dict(app_response.headers)
+        headers.setdefault("content-type", app_response.media_type)
+        return Response(
+            status_code=app_response.status_code,
+            _body=app_response.body,
+            media_type=app_response.media_type,
+            headers=headers,
+        )

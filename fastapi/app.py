@@ -4,10 +4,11 @@ from __future__ import annotations
 import inspect
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, get_type_hints
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple, get_type_hints
 from uuid import UUID
 
 from .exceptions import HTTPException
+from .responses import Response as ResponseType
 
 
 @dataclass(slots=True)
@@ -22,6 +23,8 @@ class Route:
 class AppResponse:
     status_code: int
     body: Any
+    media_type: str
+    headers: Dict[str, str]
 
 
 class Request:
@@ -43,12 +46,13 @@ class FastAPI:
         self.title = title or "FastAPI"
         self.state = SimpleNamespace()
         self._routes: List[Route] = []
+        self._mounts: List[Tuple[str, Any]] = []
 
     # Route registration helpers -------------------------------------------------
-    def get(self, path: str, *, status_code: int = 200) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def get(self, path: str, *, status_code: int = 200, **_: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         return self._register(path, "GET", status_code)
 
-    def post(self, path: str, *, status_code: int = 200) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def post(self, path: str, *, status_code: int = 200, **_: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         return self._register(path, "POST", status_code)
 
     def _register(self, path: str, method: str, status_code: int) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
@@ -59,8 +63,15 @@ class FastAPI:
 
         return decorator
 
+    def mount(self, path: str, app: Any, name: str | None = None) -> None:  # noqa: ARG002
+        prefix = path.rstrip("/") or "/"
+        self._mounts.append((prefix, app))
+
     # Request handling -----------------------------------------------------------
     def handle_request(self, method: str, path: str, body: Any | None = None) -> AppResponse:
+        mount_response = self._handle_mount(method, path)
+        if mount_response is not None:
+            return mount_response
         for route in self._routes:
             if route.method != method:
                 continue
@@ -70,12 +81,46 @@ class FastAPI:
             request = Request(self, body)
             try:
                 result = self._invoke_handler(route.handler, match, request, body)
-                return AppResponse(status_code=route.status_code, body=self._serialise(result))
+                return self._build_app_response(result, route.status_code)
             except HTTPException as exc:
-                return AppResponse(status_code=exc.status_code, body={"detail": exc.detail})
+                return AppResponse(
+                    status_code=exc.status_code,
+                    body={"detail": exc.detail},
+                    media_type="application/json",
+                    headers={},
+                )
             except ValueError as exc:
-                return AppResponse(status_code=422, body={"detail": str(exc)})
-        return AppResponse(status_code=404, body={"detail": "Not Found"})
+                return AppResponse(
+                    status_code=422,
+                    body={"detail": str(exc)},
+                    media_type="application/json",
+                    headers={},
+                )
+        return AppResponse(
+            status_code=404,
+            body={"detail": "Not Found"},
+            media_type="application/json",
+            headers={},
+        )
+
+    def _handle_mount(self, method: str, path: str) -> AppResponse | None:
+        for prefix, app in self._mounts:
+            if prefix == "/":
+                match_path = path
+            elif path.startswith(prefix + "/") or path == prefix:
+                match_path = path[len(prefix) :]
+            else:
+                continue
+
+            if hasattr(app, "handle"):
+                response = app.handle(method, match_path)
+            elif hasattr(app, "handle_request"):
+                response = app.handle_request(method, match_path, None)
+            else:
+                continue
+
+            return self._build_app_response(response, 200 if not isinstance(response, ResponseType) else response.status_code)
+        return None
 
     # Internal helpers -----------------------------------------------------------
     def _parse_path(self, path: str) -> List[tuple[bool, str]]:
@@ -159,3 +204,19 @@ class FastAPI:
         if hasattr(value, "to_dict") and callable(value.to_dict):
             return value.to_dict()
         return value
+
+    def _build_app_response(self, result: Any, default_status: int) -> AppResponse:
+        if isinstance(result, ResponseType):
+            response = result.with_defaults(default_status)
+            headers = dict(response.headers)
+            headers.setdefault("content-type", response.media_type)
+            return AppResponse(
+                status_code=response.status_code,
+                body=response.content,
+                media_type=response.media_type,
+                headers=headers,
+            )
+
+        serialised = self._serialise(result)
+        headers = {"content-type": "application/json"}
+        return AppResponse(status_code=default_status, body=serialised, media_type="application/json", headers=headers)
