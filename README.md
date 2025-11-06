@@ -84,6 +84,13 @@ TBD after tech stack decision.
 - **Storage**: IndexedDB (metadata) + Local File System (media)
 - **Target Performance**: Real-time processing on mid-tier mobile devices (2GB+ RAM)
 
+### Durable Session Storage
+- **Engine**: Async SQLite via SQLAlchemy 2.0 (`sqlite+aiosqlite`)
+- **Pragmas**: WAL + foreign-key enforcement for resilience and concurrency
+- **Tables**: `recording_sessions`, `segments`, `detections`
+- **Access Layer**: `SessionStorage` facade for session lifecycle, segments, and detections
+- **Initialization**: `python scripts/init_db.py`
+
 ### Model Strategy (Revised)
 - **Primary Detection**: Lightweight local models for initial screening
 - **Validation**: Cloud-based models for complex incident classification
