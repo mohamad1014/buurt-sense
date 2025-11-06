@@ -15,7 +15,7 @@ AI-powered neighbourhood awareness platform. Empowers communities to record and 
 The FastAPI service is created via an application factory called `create_app`. When running the development server, make sure to reference the callable instead of a module-level `app` (which is why `uvicorn app.main:app` fails).
 
 ```bash
-uvicorn app.main:create_app --reload --host 0.0.0.0 --port 8000
+uvicorn --factory app.main:create_app --reload --host 0.0.0.0 --port 8000
 ```
 
 ### Interactive Docs
