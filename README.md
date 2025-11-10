@@ -27,9 +27,28 @@ Once the server is running, visit `http://localhost:8000/` for the recording con
 Install dependencies and execute the pytest suite to validate the API behaviour:
 
 ```bash
+# Activate virtual environment first
+source .venv/bin/activate
+
+# Install dev dependencies if not already installed
 pip install -r requirements.txt
+
+# Run all tests
 pytest
+
+# Or use the convenience script
+./run_tests.sh
 ```
+
+**Important**: Always run tests from within the virtual environment to ensure all dependencies (including SQLAlchemy) are available. If you encounter import errors, make sure you've activated the virtual environment first.
+
+### Test Coverage
+
+The test suite covers:
+- ✅ Frontend serving (HTML and static assets)
+- ✅ Session lifecycle and storage
+- ✅ API endpoints for session management
+- ✅ Error handling for unknown/invalid sessions
 
 
 ## 1. Mission & Vision
@@ -295,11 +314,24 @@ curl -X GET http://localhost:8000/sessions/{session_id}
 ### Running Tests
 
 ```bash
+# Activate virtual environment first
+source .venv/bin/activate
+
+# Run all tests
 pytest
+
+# Run tests with verbose output
+pytest -v
+
+# Run specific test file
+pytest tests/test_frontend.py
+
+# Use the convenience script (automatically activates venv)
+./run_tests.sh
 ```
 
 The suite exercises the FastAPI session endpoints end-to-end, covering happy-path start/stop flows and error scenarios such as
-unknown or double-stopped sessions.
+unknown or double-stopped sessions. It also validates frontend serving and static asset delivery.
 
 ## 19. Code Style & Tooling
 
