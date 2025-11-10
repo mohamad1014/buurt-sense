@@ -32,9 +32,6 @@ uv sync --extra dev
 
 # Run all tests
 uv run --extra dev pytest
-
-# Or use the convenience script
-./run_tests.sh
 ```
 
 `uv sync --extra dev` creates a project-local virtual environment automatically (default: `.venv`) with both runtime and development dependencies. You do not need to activate it manually; `uv run` handles environment resolution for each command.
@@ -314,9 +311,6 @@ uv run --extra dev pytest -v
 
 # Run specific test file
 uv run --extra dev pytest tests/test_frontend.py
-
-# Use the convenience script
-./run_tests.sh
 ```
 
 The suite exercises the FastAPI session endpoints end-to-end, covering happy-path start/stop flows and error scenarios such as
