@@ -333,3 +333,29 @@ Buurt Sense is an assistive awareness tool and does not replace contacting emerg
 
 ---
 Please provide answers or preferences for the Outstanding Questions so the README can be finalized.
+
+## 22. Local API Prototype
+
+An initial FastAPI service lives in `app/` and persists data to a local SQLite database (`buurt_sense.db`). Install dependencies and run the server locally:
+
+```
+pip install -r requirements.txt
+uvicorn app.main:app --reload
+```
+
+### Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /sessions` | Create a recording session. Derives timezone from the provided origin and enforces metadata validation (segment length 10–60s, overlap below segment length, operator alias ≤64 chars, notes ≤500 chars). Defaults to a pseudonymous device UUID when missing. |
+| `GET /sessions` | List sessions with rounded origin coordinates, config snapshot, and detection summary counts. Includes a `status` flag (`active` / `completed`). |
+| `GET /sessions/{id}` | Retrieve full session metadata including segments. Use `expand=traces` to include GPS & orientation traces and `include=full_detections` to inline detections. |
+| `POST /sessions/{id}/segments` | Attach a media segment to a session along with traces, checksum, and sizing info. |
+| `GET /sessions/{id}/detections` | Paginate detections associated with a session. |
+| `POST /segments/{id}/detections` | Add a detection and automatically refresh the session’s aggregated detection summary (totals, per-class counts, first/last timestamps, highest-confidence detection). |
+
+### Stored Metadata Highlights
+
+- Sessions persist structured `gps_origin`, `orientation_origin`, `config_snapshot`, `detection_summary`, and the `redact_location` toggle.
+- Segments store simplified traces, frame/audio metrics, and file integrity metadata (size + checksum).
+- Detections capture model provenance, latency, GPS/orientation context, and update session aggregates immediately on insert.
