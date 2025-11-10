@@ -1,6 +1,7 @@
 """FastAPI application factory for the Buurt Sense MVP."""
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import UUID
 
@@ -29,8 +30,17 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
         Configured app instance.
     """
 
-    app = FastAPI(title="Buurt Sense API")
     store = session_store or SessionStore()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):  # pragma: no cover - exercised in integration tests
+        await store.initialize()
+        try:
+            yield
+        finally:
+            await store.close()
+
+    app = FastAPI(title="Buurt Sense API", lifespan=lifespan)
     app.state.session_store = store
 
     @app.get("/health")
@@ -40,24 +50,24 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
         return {"status": "ok"}
 
     @app.post("/sessions", status_code=status.HTTP_201_CREATED)
-    def create_session() -> Session:
+    async def create_session() -> Session:
         """Start a new recording session."""
 
-        return store.create()
+        return await store.create()
 
     @app.get("/sessions")
-    def list_sessions() -> list[Session]:
+    async def list_sessions() -> list[Session]:
         """List sessions ordered by most recent start timestamp."""
 
-        sessions = store.list()
+        sessions = await store.list()
         return sorted(sessions, key=lambda session: session.started_at, reverse=True)
 
     @app.get("/sessions/{session_id}")
-    def get_session(session_id: UUID) -> Session:
+    async def get_session(session_id: UUID) -> Session:
         """Retrieve a single session by identifier."""
 
         try:
-            return store.get(session_id)
+            return await store.get(session_id)
         except SessionNotFoundError as exc:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -65,11 +75,11 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
             ) from exc
 
     @app.post("/sessions/{session_id}/stop")
-    def stop_session(session_id: UUID) -> Session:
+    async def stop_session(session_id: UUID) -> Session:
         """Stop an active session and return the updated payload."""
 
         try:
-            return store.stop(session_id)
+            return await store.stop(session_id)
         except SessionNotFoundError as exc:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
