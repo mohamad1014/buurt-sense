@@ -1,11 +1,13 @@
 """Tests for the session management API."""
 from __future__ import annotations
 
+import asyncio
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
 from app.models import Session
+from app.storage import SessionStore
 
 
 def validate_session_payload(payload: dict) -> Session:
@@ -68,3 +70,20 @@ def test_retrieving_unknown_session_returns_not_found(client: TestClient) -> Non
     response = client.get(f"/sessions/{uuid4()}")
     assert response.status_code == 404
     assert response.json()["detail"].lower() == "session not found"
+
+
+def test_stop_session_persists_backend_artifacts(client: TestClient) -> None:
+    session = validate_session_payload(client.post("/sessions").json())
+    stop_response = client.post(f"/sessions/{session.id}/stop")
+    assert stop_response.status_code == 200
+
+    store: SessionStore = client.app.state.session_store
+
+    async def _fetch() -> object:
+        return await store.storage.get_session(str(session.id))
+
+    record = asyncio.run(_fetch())
+    segments = getattr(record, "segments", [])
+    assert segments, "recording backend should persist at least one segment"
+    detections = getattr(segments[0], "detections", [])
+    assert detections, "recording backend should persist detections for the segment"
