@@ -15,7 +15,7 @@ AI-powered neighbourhood awareness platform. Empowers communities to record and 
 The FastAPI service is created via an application factory called `create_app`. When running the development server, make sure to reference the callable instead of a module-level `app` (which is why `uvicorn app.main:app` fails).
 
 ```bash
-uvicorn --factory app.main:create_app --reload --host 0.0.0.0 --port 8000
+uv run uvicorn --factory app.main:create_app --reload --host 0.0.0.0 --port 8000
 ```
 
 ### Interactive Docs
@@ -24,23 +24,17 @@ Once the server is running, visit `http://localhost:8000/` for the recording con
 
 ## Running Tests
 
-Install dependencies and execute the pytest suite to validate the API behaviour:
+Install dependencies with [uv](https://docs.astral.sh/uv/) and execute the pytest suite to validate the API behaviour:
 
 ```bash
-# Activate virtual environment first
-source .venv/bin/activate
-
-# Install dev dependencies if not already installed
-pip install -r requirements.txt
+# Install runtime + development dependencies
+uv sync --extra dev
 
 # Run all tests
-pytest
-
-# Or use the convenience script
-./run_tests.sh
+uv run --extra dev pytest
 ```
 
-**Important**: Always run tests from within the virtual environment to ensure all dependencies (including SQLAlchemy) are available. If you encounter import errors, make sure you've activated the virtual environment first.
+`uv sync --extra dev` creates a project-local virtual environment automatically (default: `.venv`) with both runtime and development dependencies. You do not need to activate it manually; `uv run` handles environment resolution for each command.
 
 ### Test Coverage
 
@@ -230,12 +224,11 @@ Setup (TBD pending architecture decision):
 git clone https://github.com/mohamad1014/buurt-sense.git
 cd buurt-sense
 
-# (Option A) Install backend deps
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+# Install backend dependencies with uv
+uv sync
 
 # Run the minimal FastAPI service
-uvicorn backend.main:app --reload
+uv run uvicorn backend.main:app --reload
 
 # (Option B) Frontend
 npm install  # after package.json added
@@ -244,24 +237,17 @@ npm install  # after package.json added
 ## 16. Backend Quickstart
 Follow these steps to get the FastAPI backend running locally.
 
-### 1. Create and Activate a Virtual Environment
+### 1. Install Dependencies
 ```bash
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
+uv sync --extra dev
 ```
 
-### 2. Install Dependencies
+### 2. Launch the Development Server
 ```bash
-pip install --upgrade pip
-pip install -r requirements.txt
+uv run uvicorn --factory app.main:create_app --reload --host 0.0.0.0 --port 8000
 ```
 
-### 3. Launch the Development Server
-```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-### 4. Exercise the API
+### 3. Exercise the API
 Use HTTPie or curl to interact with core endpoints once the server is running.
 
 #### Health Check (`GET /health`)
@@ -314,20 +300,17 @@ curl -X GET http://localhost:8000/sessions/{session_id}
 ### Running Tests
 
 ```bash
-# Activate virtual environment first
-source .venv/bin/activate
+# Ensure dependencies are installed (runtime + dev)
+uv sync --extra dev
 
 # Run all tests
-pytest
+uv run --extra dev pytest
 
 # Run tests with verbose output
-pytest -v
+uv run --extra dev pytest -v
 
 # Run specific test file
-pytest tests/test_frontend.py
-
-# Use the convenience script (automatically activates venv)
-./run_tests.sh
+uv run --extra dev pytest tests/test_frontend.py
 ```
 
 The suite exercises the FastAPI session endpoints end-to-end, covering happy-path start/stop flows and error scenarios such as
@@ -338,11 +321,11 @@ unknown or double-stopped sessions. It also validates frontend serving and stati
 Python source in this repository is formatted with [Black](https://black.readthedocs.io/) and linted with [Ruff](https://docs.astral.sh/ruff/). Run them locally before opening a pull request:
 
 ```
-black backend tests
-ruff check backend tests
+uv run --extra dev black backend tests
+uv run --extra dev ruff check backend tests
 ```
 
-Convenience targets are available via `make`:
+Convenience targets are available via `make` and automatically execute through `uv`:
 
 ```
 make format
@@ -378,8 +361,8 @@ Please provide answers or preferences for the Outstanding Questions so the READM
 An initial FastAPI service lives in `app/` and persists data to a local SQLite database (`buurt_sense.db`). Install dependencies and run the server locally:
 
 ```
-pip install -r requirements.txt
-uvicorn app.main:app --reload
+uv sync
+uv run uvicorn --factory app.main:create_app --reload
 ```
 
 ### Endpoints

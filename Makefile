@@ -1,7 +1,7 @@
 .PHONY: format lint
 
 format:
-	black backend tests
+uv run --extra dev black backend tests
 
 lint:
-	ruff check backend tests
+uv run --extra dev ruff check backend tests
