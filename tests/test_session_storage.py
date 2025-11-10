@@ -10,14 +10,16 @@ from buurtsense.storage import (
 )
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio("asyncio")
 async def test_session_lifecycle(tmp_path):
     db_url = f"sqlite+aiosqlite:///{tmp_path / 'test.db'}"
     storage = SessionStorage(db_url=db_url)
     await storage.initialize()
 
     session = await storage.create_session(
-        RecordingSessionCreate(started_at=datetime.now(UTC), device_info={"device": "test"})
+        RecordingSessionCreate(
+            started_at=datetime.now(UTC), device_info={"device": "test"}
+        )
     )
 
     segment = await storage.create_segment(

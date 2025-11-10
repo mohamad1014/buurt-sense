@@ -1,11 +1,11 @@
 """Tests for the session management API."""
+
 from __future__ import annotations
 
 from uuid import uuid4
 
-from fastapi.testclient import TestClient
-
 from app.models import Session
+from tests.conftest import SimpleClient
 
 
 def validate_session_payload(payload: dict) -> Session:
@@ -13,11 +13,13 @@ def validate_session_payload(payload: dict) -> Session:
     assert session.started_at.tzinfo is not None, "started_at must be timezone-aware"
     if session.ended_at is not None:
         assert session.ended_at.tzinfo is not None, "ended_at must be timezone-aware"
-        assert session.ended_at >= session.started_at, "ended_at cannot precede started_at"
+        assert (
+            session.ended_at >= session.started_at
+        ), "ended_at cannot precede started_at"
     return session
 
 
-def test_session_lifecycle(client: TestClient) -> None:
+def test_session_lifecycle(client: SimpleClient) -> None:
     response = client.post("/sessions")
     assert response.status_code == 201
     session = validate_session_payload(response.json())
@@ -45,14 +47,14 @@ def test_session_lifecycle(client: TestClient) -> None:
     assert session.id in {item.id for item in sessions}
 
 
-def test_stopping_unknown_session_returns_not_found(client: TestClient) -> None:
+def test_stopping_unknown_session_returns_not_found(client: SimpleClient) -> None:
     unknown_id = uuid4()
     response = client.post(f"/sessions/{unknown_id}/stop")
     assert response.status_code == 404
     assert response.json()["detail"].lower() == "session not found"
 
 
-def test_double_stop_returns_conflict(client: TestClient) -> None:
+def test_double_stop_returns_conflict(client: SimpleClient) -> None:
     session = validate_session_payload(client.post("/sessions").json())
 
     first_stop = client.post(f"/sessions/{session.id}/stop")
@@ -64,7 +66,7 @@ def test_double_stop_returns_conflict(client: TestClient) -> None:
     assert second_stop.json()["detail"].lower() == "session already stopped"
 
 
-def test_retrieving_unknown_session_returns_not_found(client: TestClient) -> None:
+def test_retrieving_unknown_session_returns_not_found(client: SimpleClient) -> None:
     response = client.get(f"/sessions/{uuid4()}")
     assert response.status_code == 404
     assert response.json()["detail"].lower() == "session not found"
