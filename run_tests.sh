@@ -7,8 +7,8 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 # Change to project directory
 cd "$SCRIPT_DIR"
 
-# Activate virtual environment
-source .venv/bin/activate
+# Ensure dependencies are installed before running tests
+uv sync --extra dev >/dev/null
 
-# Run pytest with all arguments passed to this script
-python -m pytest "$@"
+# Run pytest with uv so the managed environment is used automatically
+uv run --extra dev pytest "$@"
