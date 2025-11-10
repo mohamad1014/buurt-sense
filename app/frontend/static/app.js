@@ -6,6 +6,10 @@ const activeSessionDetails = document.getElementById("active-session-details");
 const sessionList = document.getElementById("session-list");
 
 let activeSession = null;
+let liveWebSocket = null;
+let liveEventSource = null;
+let pollingTimer = null;
+let shuttingDown = false;
 
 function formatTimestamp(timestamp) {
   if (!timestamp) {
@@ -36,6 +40,27 @@ function setStatus(message, tone = "info") {
 function toggleButtons(isRecording) {
   startButton.disabled = isRecording;
   stopButton.disabled = !isRecording;
+}
+
+function handleSessionSnapshot(sessions) {
+  const ordered = [...sessions].sort((a, b) =>
+    a.started_at < b.started_at ? 1 : -1,
+  );
+
+  renderSessions(ordered);
+
+  const running = ordered.find((session) => !session.ended_at);
+  if (running) {
+    activeSession = running;
+  } else if (activeSession) {
+    const latest = ordered.find((session) => session.id === activeSession.id);
+    activeSession = latest || null;
+  } else {
+    activeSession = null;
+  }
+
+  renderActiveSession(activeSession);
+  toggleButtons(Boolean(activeSession && !activeSession.ended_at));
 }
 
 function renderActiveSession(session) {
@@ -101,19 +126,14 @@ async function fetchJson(url, options) {
   return response.json();
 }
 
-async function loadSessions() {
+async function loadSessions(options = {}) {
+  const announce = options.announce ?? true;
   try {
     const sessions = await fetchJson("/sessions");
-    renderSessions(sessions.sort((a, b) => (a.started_at < b.started_at ? 1 : -1)));
-    if (activeSession) {
-      const latest = sessions.find((session) => session.id === activeSession.id);
-      if (latest) {
-        activeSession = latest;
-        renderActiveSession(activeSession);
-        toggleButtons(!Boolean(activeSession.ended_at));
-      }
+    handleSessionSnapshot(sessions);
+    if (announce) {
+      setStatus("Session list updated.");
     }
-    setStatus("Session list updated.");
   } catch (error) {
     console.error("Failed to load sessions", error);
     setStatus(`Unable to load session history: ${error.message}`, "error");
@@ -129,7 +149,7 @@ async function startSession() {
     renderActiveSession(session);
     toggleButtons(true);
     setStatus("Session started. Recording in progress.", "success");
-    await loadSessions();
+    await loadSessions({ announce: false });
   } catch (error) {
     console.error("Failed to start session", error);
     setStatus(`Unable to start session: ${error.message}`, "error");
@@ -153,11 +173,122 @@ async function stopSession() {
     renderActiveSession(session);
     toggleButtons(false);
     setStatus("Session stopped.", "success");
-    await loadSessions();
+    await loadSessions({ announce: false });
   } catch (error) {
     console.error("Failed to stop session", error);
     setStatus(`Unable to stop session: ${error.message}`, "error");
     stopButton.disabled = false;
+  }
+}
+
+function stopPolling() {
+  if (pollingTimer) {
+    window.clearInterval(pollingTimer);
+    pollingTimer = null;
+  }
+}
+
+function startPolling() {
+  if (pollingTimer) {
+    return;
+  }
+  pollingTimer = window.setInterval(() => {
+    loadSessions({ announce: false }).catch((error) => {
+      console.error("Polling update failed", error);
+    });
+  }, 10000);
+}
+
+function connectEventSource() {
+  if (!("EventSource" in window)) {
+    return false;
+  }
+
+  liveEventSource = new EventSource("/sessions/events");
+  liveEventSource.onmessage = (event) => {
+    try {
+      const sessions = JSON.parse(event.data);
+      handleSessionSnapshot(sessions);
+    } catch (error) {
+      console.error("Failed to parse SSE payload", error);
+    }
+  };
+  liveEventSource.onerror = () => {
+    if (shuttingDown) {
+      return;
+    }
+    console.warn("SSE connection lost. Falling back to polling.");
+    liveEventSource.close();
+    liveEventSource = null;
+    startPolling();
+  };
+
+  stopPolling();
+  return true;
+}
+
+function connectWebSocket() {
+  if (!("WebSocket" in window)) {
+    return false;
+  }
+
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  liveWebSocket = new WebSocket(`${protocol}://${window.location.host}/ws/sessions`);
+
+  liveWebSocket.onmessage = (event) => {
+    try {
+      const sessions = JSON.parse(event.data);
+      handleSessionSnapshot(sessions);
+    } catch (error) {
+      console.error("Failed to parse websocket payload", error);
+    }
+  };
+
+  liveWebSocket.onclose = () => {
+    if (shuttingDown) {
+      return;
+    }
+    liveWebSocket = null;
+    if (connectEventSource()) {
+      return;
+    }
+    startPolling();
+  };
+
+  liveWebSocket.onerror = () => {
+    if (liveWebSocket) {
+      liveWebSocket.close();
+    }
+  };
+
+  stopPolling();
+  return true;
+}
+
+function setupLiveUpdates() {
+  if (connectWebSocket()) {
+    return;
+  }
+  if (connectEventSource()) {
+    return;
+  }
+  startPolling();
+}
+
+function cleanupLiveUpdates() {
+  shuttingDown = true;
+  stopPolling();
+  if (liveWebSocket) {
+    const socket = liveWebSocket;
+    liveWebSocket = null;
+    socket.onclose = null;
+    socket.close();
+  }
+  if (liveEventSource) {
+    const source = liveEventSource;
+    liveEventSource = null;
+    source.onerror = null;
+    source.close();
   }
 }
 
@@ -168,4 +299,7 @@ refreshButton.addEventListener("click", loadSessions);
 document.addEventListener("DOMContentLoaded", async () => {
   setStatus("Loading sessions…");
   await loadSessions();
+  setupLiveUpdates();
 });
+
+window.addEventListener("beforeunload", cleanupLiveUpdates);
