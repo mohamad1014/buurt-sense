@@ -1,3 +1,27 @@
+[project]
+name = "buurt-sense"
+version = "0.1.0"
+description = "Core components for the Buurt Sense offline-first session storage."
+authors = [{ name = "Buurt Sense" }]
+requires-python = ">=3.11"
+dependencies = [
+    "SQLAlchemy>=2.0",
+    "aiosqlite>=0.19",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+asyncio_mode = "auto"
 [tool.black]
 line-length = 88
 target-version = ["py311"]
