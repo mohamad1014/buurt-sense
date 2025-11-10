@@ -1,7 +1,10 @@
 """Tests for the session management API."""
+
 from __future__ import annotations
 
 import asyncio
+import json
+from collections.abc import Iterator
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -15,7 +18,9 @@ def validate_session_payload(payload: dict) -> Session:
     assert session.started_at.tzinfo is not None, "started_at must be timezone-aware"
     if session.ended_at is not None:
         assert session.ended_at.tzinfo is not None, "ended_at must be timezone-aware"
-        assert session.ended_at >= session.started_at, "ended_at cannot precede started_at"
+        assert (
+            session.ended_at >= session.started_at
+        ), "ended_at cannot precede started_at"
     return session
 
 
@@ -87,3 +92,45 @@ def test_stop_session_persists_backend_artifacts(client: TestClient) -> None:
     assert segments, "recording backend should persist at least one segment"
     detections = getattr(segments[0], "detections", [])
     assert detections, "recording backend should persist detections for the segment"
+
+
+def _next_sse_payload(lines: Iterator[str]) -> list[dict]:
+    for line in lines:
+        if not line:
+            continue
+        if line.startswith("data:"):
+            return json.loads(line.removeprefix("data:").strip())
+    raise AssertionError("No SSE payload received")
+
+
+def test_session_events_stream_provides_live_updates(client: TestClient) -> None:
+    with client.stream("GET", "/sessions/events") as stream:
+        lines = stream.iter_lines()
+        initial_payload = _next_sse_payload(lines)
+        assert isinstance(initial_payload, list)
+        assert not initial_payload
+
+        session = validate_session_payload(client.post("/sessions").json())
+        update_payload = _next_sse_payload(lines)
+        assert any(item["id"] == str(session.id) for item in update_payload)
+
+        client.post(f"/sessions/{session.id}/stop")
+        final_payload = _next_sse_payload(lines)
+        stopped = next(item for item in final_payload if item["id"] == str(session.id))
+        assert stopped["ended_at"] is not None
+
+
+def test_session_websocket_provides_live_updates(client: TestClient) -> None:
+    with client.websocket_connect("/ws/sessions") as websocket:
+        initial = websocket.receive_json()
+        assert isinstance(initial, list)
+        assert not initial
+
+        session = validate_session_payload(client.post("/sessions").json())
+        update = websocket.receive_json()
+        assert any(item["id"] == str(session.id) for item in update)
+
+        client.post(f"/sessions/{session.id}/stop")
+        final = websocket.receive_json()
+        stopped = next(item for item in final if item["id"] == str(session.id))
+        assert stopped["ended_at"] is not None

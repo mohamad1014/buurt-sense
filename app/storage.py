@@ -1,7 +1,9 @@
 """Durable storage management and backend hooks for recording sessions."""
+
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Dict, Protocol
@@ -107,6 +109,8 @@ class SessionStore:
         self._now = now or (lambda: datetime.now(UTC))
         self._lock = asyncio.Lock()
         self._initialized = False
+        self._subscribers: set[asyncio.Queue[list[Session]]] = set()
+        self._subscribers_lock = asyncio.Lock()
 
     @property
     def storage(self) -> SessionStorage:
@@ -154,7 +158,9 @@ class SessionStore:
             RecordingSessionCreate(started_at=started_at)
         )
         await self._backend.start(record.id, started_at=started_at)
-        return self._to_session(record)
+        session = self._to_session(record)
+        await self._broadcast()
+        return session
 
     async def stop(self, session_id: UUID) -> Session:
         """Stop an active session and persist the end timestamp."""
@@ -169,7 +175,9 @@ class SessionStore:
             record.id,
             RecordingSessionUpdate(ended_at=ended_at),
         )
-        return self._to_session(updated)
+        session = self._to_session(updated)
+        await self._broadcast()
+        return session
 
     async def get(self, session_id: UUID) -> Session:
         """Fetch a single session by identifier."""
@@ -180,10 +188,23 @@ class SessionStore:
     async def list(self) -> list[Session]:
         """List all sessions ordered by most recent start time."""
 
-        await self.initialize()
-        records = await self._storage.list_sessions()
-        sessions = [self._to_session(record) for record in records]
-        return sorted(sessions, key=lambda session: session.started_at, reverse=True)
+        return await self._snapshot()
+
+    async def subscribe(self) -> AsyncIterator[list[Session]]:
+        """Yield session snapshots whenever the store mutates."""
+
+        queue: asyncio.Queue[list[Session]] = asyncio.Queue(maxsize=1)
+        async with self._subscribers_lock:
+            self._subscribers.add(queue)
+
+        try:
+            await queue.put(await self._snapshot())
+            while True:
+                sessions = await queue.get()
+                yield sessions
+        finally:
+            async with self._subscribers_lock:
+                self._subscribers.discard(queue)
 
     async def _get_record(self, session_id: UUID) -> Any:
         await self.initialize()
@@ -201,3 +222,33 @@ class SessionStore:
             ended_at=getattr(record, "ended_at", None),
         )
         return adapter.to_session()
+
+    async def _snapshot(self) -> list[Session]:
+        """Return a sorted snapshot of all persisted sessions."""
+
+        await self.initialize()
+        records = await self._storage.list_sessions()
+        sessions = [self._to_session(record) for record in records]
+        return sorted(sessions, key=lambda session: session.started_at, reverse=True)
+
+    async def _broadcast(self) -> None:
+        """Push the current snapshot to all registered subscribers."""
+
+        sessions = await self._snapshot()
+        async with self._subscribers_lock:
+            subscribers = list(self._subscribers)
+
+        for queue in subscribers:
+            try:
+                queue.put_nowait(sessions)
+            except asyncio.QueueFull:
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    queue.put_nowait(sessions)
+                except asyncio.QueueFull:
+                    # Drop the update if the subscriber is unresponsive; the next
+                    # snapshot will overwrite any stale data.
+                    continue
