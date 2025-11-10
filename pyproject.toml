@@ -5,14 +5,22 @@ description = "Core components for the Buurt Sense offline-first session storage
 authors = [{ name = "Buurt Sense" }]
 requires-python = ">=3.11"
 dependencies = [
-    "SQLAlchemy>=2.0",
-    "aiosqlite>=0.19",
+  # Runtime dependencies (aligned with requirements.txt)
+  "sqlmodel==0.0.14",
+  "sqlalchemy==2.0.28",
+  "pydantic==1.10.15",
+  "fastapi==0.121.0",
+  "timezonefinder==6.2.0",
+  "uvicorn[standard]>=0.30.0,<1.0.0",
+  "aiosqlite>=0.19",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+  # Needed for starlette.testclient / fastapi.testclient
+  "httpx>=0.27",
 ]
 
 [build-system]

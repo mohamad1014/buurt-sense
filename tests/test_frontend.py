@@ -28,5 +28,7 @@ def test_static_assets_are_available() -> None:
     response = client.get("/static/app.js")
 
     assert response.status_code == 200
-    assert "application/javascript" in response.headers["content-type"]
+    # Accept both common JavaScript MIME types
+    content_type = response.headers["content-type"]
+    assert "javascript" in content_type
     assert "startSession" in response.text
