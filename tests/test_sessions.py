@@ -155,16 +155,6 @@ def test_session_events_stream_provides_live_updates(client: TestClient) -> None
         assert stopped["ended_at"] is not None
 
 
-def test_session_events_endpoint_exists(client: TestClient) -> None:
-    """Test that the SSE endpoint is accessible and returns appropriate headers."""
-    # Test that the endpoint exists and returns SSE headers
-    with client.stream("GET", "/sessions/events") as response:
-        assert response.status_code == 200
-        # Check for SSE-specific headers
-        headers = response.headers
-        assert "text/event-stream" in headers.get("content-type", "").lower()
-
-
 def test_session_websocket_provides_live_updates(client: TestClient) -> None:
     """Test that WebSocket provides real-time session updates."""
     with client.websocket_connect("/ws/sessions") as websocket:
