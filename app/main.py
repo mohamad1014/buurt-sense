@@ -73,35 +73,6 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
 
         return await store.list()
 
-    @app.get("/sessions/{session_id}")
-    async def get_session(session_id: UUID) -> Session:
-        """Retrieve a single session by identifier."""
-
-        try:
-            return await store.get(session_id)
-        except SessionNotFoundError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Session not found",
-            ) from exc
-
-    @app.post("/sessions/{session_id}/stop")
-    async def stop_session(session_id: UUID) -> Session:
-        """Stop an active session and return the updated payload."""
-
-        try:
-            return await store.stop(session_id)
-        except SessionNotFoundError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Session not found",
-            ) from exc
-        except SessionAlreadyStoppedError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Session already stopped",
-            ) from exc
-
     @app.get("/sessions/events")
     async def session_events(request: Request) -> StreamingResponse:
         """Stream session snapshots using the Server-Sent Events protocol."""
@@ -134,6 +105,35 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
         return StreamingResponse(
             event_generator(), media_type="text/event-stream", headers=headers
         )
+
+    @app.get("/sessions/{session_id}")
+    async def get_session(session_id: UUID) -> Session:
+        """Retrieve a single session by identifier."""
+
+        try:
+            return await store.get(session_id)
+        except SessionNotFoundError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Session not found",
+            ) from exc
+
+    @app.post("/sessions/{session_id}/stop")
+    async def stop_session(session_id: UUID) -> Session:
+        """Stop an active session and return the updated payload."""
+
+        try:
+            return await store.stop(session_id)
+        except SessionNotFoundError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Session not found",
+            ) from exc
+        except SessionAlreadyStoppedError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Session already stopped",
+            ) from exc
 
     @app.websocket("/ws/sessions")
     async def session_websocket(websocket: WebSocket) -> None:
