@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -106,11 +107,12 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
         """Stream session snapshots using the Server-Sent Events protocol."""
 
         async def event_generator():
-            async for sessions in store.subscribe():
-                payload = json.dumps([session.to_dict() for session in sessions])
-                yield f"data: {payload}\n\n".encode("utf-8")
-                if await request.is_disconnected():
-                    return
+            try:
+                async for sessions in store.subscribe():
+                    payload = json.dumps([session.to_dict() for session in sessions])
+                    yield f"data: {payload}\n\n".encode("utf-8")
+            except asyncio.CancelledError:  # pragma: no cover - cancellation ends stream
+                return
 
         headers = {"Cache-Control": "no-store", "Connection": "keep-alive"}
         return StreamingResponse(
