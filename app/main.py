@@ -1,11 +1,21 @@
 """FastAPI application factory for the Buurt Sense MVP."""
+
 from __future__ import annotations
 
+import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, status
-from fastapi.responses import HTMLResponse
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .models import Session
@@ -29,8 +39,19 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
         Configured app instance.
     """
 
-    app = FastAPI(title="Buurt Sense API")
     store = session_store or SessionStore()
+
+    @asynccontextmanager
+    async def lifespan(
+        app: FastAPI,
+    ):  # pragma: no cover - exercised in integration tests
+        await store.initialize()
+        try:
+            yield
+        finally:
+            await store.close()
+
+    app = FastAPI(title="Buurt Sense API", lifespan=lifespan)
     app.state.session_store = store
 
     @app.get("/health")
@@ -40,24 +61,23 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
         return {"status": "ok"}
 
     @app.post("/sessions", status_code=status.HTTP_201_CREATED)
-    def create_session() -> Session:
+    async def create_session() -> Session:
         """Start a new recording session."""
 
-        return store.create()
+        return await store.create()
 
     @app.get("/sessions")
-    def list_sessions() -> list[Session]:
+    async def list_sessions() -> list[Session]:
         """List sessions ordered by most recent start timestamp."""
 
-        sessions = store.list()
-        return sorted(sessions, key=lambda session: session.started_at, reverse=True)
+        return await store.list()
 
     @app.get("/sessions/{session_id}")
-    def get_session(session_id: UUID) -> Session:
+    async def get_session(session_id: UUID) -> Session:
         """Retrieve a single session by identifier."""
 
         try:
-            return store.get(session_id)
+            return await store.get(session_id)
         except SessionNotFoundError as exc:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -65,11 +85,11 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
             ) from exc
 
     @app.post("/sessions/{session_id}/stop")
-    def stop_session(session_id: UUID) -> Session:
+    async def stop_session(session_id: UUID) -> Session:
         """Stop an active session and return the updated payload."""
 
         try:
-            return store.stop(session_id)
+            return await store.stop(session_id)
         except SessionNotFoundError as exc:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -81,10 +101,41 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
                 detail="Session already stopped",
             ) from exc
 
+    @app.get("/sessions/events")
+    async def session_events(request: Request) -> StreamingResponse:
+        """Stream session snapshots using the Server-Sent Events protocol."""
+
+        async def event_generator():
+            async for sessions in store.subscribe():
+                if await request.is_disconnected():
+                    return
+                payload = json.dumps([session.to_dict() for session in sessions])
+                yield f"data: {payload}\n\n"
+
+        headers = {"Cache-Control": "no-store", "Connection": "keep-alive"}
+        return StreamingResponse(
+            event_generator(), media_type="text/event-stream", headers=headers
+        )
+
+    @app.websocket("/ws/sessions")
+    async def session_websocket(websocket: WebSocket) -> None:
+        """Push live session snapshots to connected websocket clients."""
+
+        await websocket.accept()
+        try:
+            async for sessions in store.subscribe():
+                await websocket.send_json([session.to_dict() for session in sessions])
+        except WebSocketDisconnect:  # pragma: no cover - handled by FastAPI runtime
+            return
+        except RuntimeError:  # pragma: no cover - defensive guard for closed sockets
+            return
+
     if FRONTEND_DIR.exists():
         static_dir = FRONTEND_DIR / "static"
         if static_dir.exists():
-            app.mount("/static", StaticFiles(directory=static_dir, html=False), name="static")
+            app.mount(
+                "/static", StaticFiles(directory=static_dir, html=False), name="static"
+            )
 
         @app.get("/", response_class=HTMLResponse)
         def serve_frontend() -> HTMLResponse:
