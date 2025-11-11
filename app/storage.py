@@ -215,11 +215,57 @@ class SessionStore:
         except KeyError as exc:  # pragma: no cover - secondary guard
             raise SessionNotFoundError(str(session_id)) from exc
 
+    @staticmethod
+    def _normalize_datetime(value: Any, *, field: str, required: bool) -> datetime | None:
+        """
+        Return a timezone-aware datetime converted to UTC.
+
+        SQLite stores timestamps without timezone information by default, so we
+        defensively attach UTC to any naive values returned by SQLAlchemy and
+        coerce ISO8601 strings to datetime instances.
+        """
+
+        if value is None:
+            if required:
+                raise ValueError(f"{field} cannot be None")
+            return None
+
+        dt: datetime
+        if isinstance(value, datetime):
+            dt = value
+        elif isinstance(value, str):
+            try:
+                dt = datetime.fromisoformat(value)
+            except ValueError as exc:
+                raise ValueError(f"Invalid datetime string for {field}: {value}") from exc
+        else:
+            raise TypeError(f"Unsupported {field} value: {value!r}")
+
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
+
     def _to_session(self, record: Any) -> Session:
+        """Convert a database record to a Session, ensuring timezone-aware datetimes."""
+
+        started_at = self._normalize_datetime(
+            getattr(record, "started_at", None),
+            field="started_at",
+            required=True,
+        )
+        if started_at is None:  # pragma: no cover - defensive guard
+            raise ValueError("started_at cannot be None")
+
+        ended_at = self._normalize_datetime(
+            getattr(record, "ended_at", None),
+            field="ended_at",
+            required=False,
+        )
+
         adapter = _RecordAdapter(
             id=str(record.id),
-            started_at=record.started_at,
-            ended_at=getattr(record, "ended_at", None),
+            started_at=started_at,
+            ended_at=ended_at,
         )
         return adapter.to_session()
 
