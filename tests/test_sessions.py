@@ -8,7 +8,6 @@ import time
 from collections.abc import Iterator
 from uuid import uuid4
 
-import pytest
 from fastapi.testclient import TestClient
 
 from app.models import Session
@@ -102,57 +101,56 @@ def test_stop_session_persists_backend_artifacts(client: TestClient) -> None:
     assert detections, "recording backend should persist detections for the segment"
 
 
-def _next_sse_payload(lines: Iterator[str], timeout: float = 5.0) -> list[dict] | None:
-    """Extract the next SSE payload with timeout to prevent infinite loops.
-    
-    Returns None if no payload is received within timeout or stream ends.
-    """
-    start_time = time.time()
-    try:
-        for line in lines:
-            if time.time() - start_time > timeout:
-                return None
-            
-            if not line:
-                continue
-            if line.startswith("data:"):
-                return json.loads(line.removeprefix("data:").strip())
-    except StopIteration:
-        # Stream ended
-        return None
-    return None
+def _read_sse_snapshot(
+    lines: Iterator[str | bytes], *, timeout: float = 5.0
+) -> list[Session]:
+    """Return the next session snapshot emitted by the SSE stream."""
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            line = next(lines)
+        except StopIteration as exc:  # pragma: no cover - defensive guard
+            raise AssertionError("SSE stream ended unexpectedly") from exc
+
+        if not line:
+            continue
+
+        if isinstance(line, bytes):
+            line = line.decode("utf-8")
+
+        if not line.startswith("data:"):
+            continue
+
+        payload = json.loads(line.removeprefix("data:").strip())
+        assert isinstance(payload, list)
+        return [Session.model_validate(item) for item in payload]
+
+    raise AssertionError("Timed out waiting for SSE payload")
 
 
-@pytest.mark.skip(reason="SSE streaming not properly supported in test environment")
 def test_session_events_stream_provides_live_updates(client: TestClient) -> None:
-    """Test that SSE stream provides real-time session updates."""
+    """The SSE endpoint should emit snapshots for lifecycle changes."""
+
     with client.stream("GET", "/sessions/events") as stream:
-        lines = stream.iter_lines()
-        
-        # Get initial empty payload
-        initial_payload = _next_sse_payload(lines, timeout=2.0)
-        if initial_payload is None:
-            pytest.skip("SSE stream not available in test environment")
-        
-        assert isinstance(initial_payload, list)
-        assert not initial_payload
+        assert stream.status_code == 200
+        assert stream.headers.get("content-type", "").startswith("text/event-stream")
+        snapshots = stream.iter_lines()
 
-        # Create session and verify update
+        initial = _read_sse_snapshot(snapshots, timeout=2.0)
+        assert initial == []
+
         session = validate_session_payload(client.post("/sessions").json())
-        update_payload = _next_sse_payload(lines, timeout=3.0)
-        if update_payload is None:
-            pytest.skip("SSE updates not received in test environment")
-        
-        assert any(item["id"] == str(session.id) for item in update_payload)
+        update = _read_sse_snapshot(snapshots, timeout=3.0)
+        updated_sessions = {item.id: item for item in update}
+        assert session.id in updated_sessions
+        assert updated_sessions[session.id].ended_at is None
 
-        # Stop session and verify final update
         client.post(f"/sessions/{session.id}/stop")
-        final_payload = _next_sse_payload(lines, timeout=3.0)
-        if final_payload is None:
-            pytest.skip("SSE final update not received in test environment")
-        
-        stopped = next(item for item in final_payload if item["id"] == str(session.id))
-        assert stopped["ended_at"] is not None
+        final = _read_sse_snapshot(snapshots, timeout=3.0)
+        stopped_sessions = {item.id: item for item in final}
+        assert session.id in stopped_sessions
+        assert stopped_sessions[session.id].ended_at is not None
 
 
 def test_session_websocket_provides_live_updates(client: TestClient) -> None:
@@ -173,3 +171,4 @@ def test_session_websocket_provides_live_updates(client: TestClient) -> None:
         final = websocket.receive_json()
         stopped = next(item for item in final if item["id"] == str(session.id))
         assert stopped["ended_at"] is not None
+

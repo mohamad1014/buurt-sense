@@ -2,19 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import (
-    FastAPI,
-    HTTPException,
-    Request,
-    WebSocket,
-    WebSocketDisconnect,
-    status,
-)
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -72,6 +66,26 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
 
         return await store.list()
 
+    @app.get("/sessions/events")
+    async def session_events() -> StreamingResponse:
+        """Stream session snapshots using the Server-Sent Events protocol."""
+
+        async def event_generator():
+            try:
+                async with aclosing(store.subscribe()) as snapshots:
+                    async for sessions in snapshots:
+                        payload = json.dumps(
+                            [session.to_dict() for session in sessions]
+                        )
+                        yield f"data: {payload}\n\n"
+            except asyncio.CancelledError:  # pragma: no cover - cancellation ends stream
+                return
+
+        headers = {"Cache-Control": "no-store", "Connection": "keep-alive"}
+        return StreamingResponse(
+            event_generator(), media_type="text/event-stream", headers=headers
+        )
+
     @app.get("/sessions/{session_id}")
     async def get_session(session_id: UUID) -> Session:
         """Retrieve a single session by identifier."""
@@ -100,22 +114,6 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Session already stopped",
             ) from exc
-
-    @app.get("/sessions/events")
-    async def session_events(request: Request) -> StreamingResponse:
-        """Stream session snapshots using the Server-Sent Events protocol."""
-
-        async def event_generator():
-            async for sessions in store.subscribe():
-                if await request.is_disconnected():
-                    return
-                payload = json.dumps([session.to_dict() for session in sessions])
-                yield f"data: {payload}\n\n"
-
-        headers = {"Cache-Control": "no-store", "Connection": "keep-alive"}
-        return StreamingResponse(
-            event_generator(), media_type="text/event-stream", headers=headers
-        )
 
     @app.websocket("/ws/sessions")
     async def session_websocket(websocket: WebSocket) -> None:
