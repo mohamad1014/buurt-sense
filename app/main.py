@@ -107,10 +107,10 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
 
         async def event_generator():
             async for sessions in store.subscribe():
+                payload = json.dumps([session.to_dict() for session in sessions])
+                yield f"data: {payload}\n\n".encode("utf-8")
                 if await request.is_disconnected():
                     return
-                payload = json.dumps([session.to_dict() for session in sessions])
-                yield f"data: {payload}\n\n"
 
         headers = {"Cache-Control": "no-store", "Connection": "keep-alive"}
         return StreamingResponse(

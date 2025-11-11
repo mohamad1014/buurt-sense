@@ -123,7 +123,6 @@ def _next_sse_payload(lines: Iterator[str], timeout: float = 5.0) -> list[dict] 
     return None
 
 
-@pytest.mark.skip(reason="SSE streaming not properly supported in test environment")
 def test_session_events_stream_provides_live_updates(client: TestClient) -> None:
     """Test that SSE stream provides real-time session updates."""
     with client.stream("GET", "/sessions/events") as stream:
