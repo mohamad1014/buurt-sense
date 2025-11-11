@@ -74,30 +74,17 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
         return await store.list()
 
     @app.get("/sessions/events")
-    async def session_events(request: Request) -> StreamingResponse:
+    async def session_events(_request: Request) -> StreamingResponse:
         """Stream session snapshots using the Server-Sent Events protocol."""
 
         async def event_generator():
             async with aclosing(store.subscribe()) as iterator:
                 try:
-                    sessions = await anext(iterator)
-                except StopAsyncIteration:  # pragma: no cover - defensive guard
-                    return
-
-                try:
-                    while True:
+                    async for sessions in iterator:
                         payload = json.dumps(
                             [session.to_dict() for session in sessions]
                         )
                         yield f"data: {payload}\n\n"
-
-                        if await request.is_disconnected():
-                            return
-
-                        try:
-                            sessions = await anext(iterator)
-                        except StopAsyncIteration:  # pragma: no cover - iterator closed
-                            return
                 except asyncio.CancelledError:  # pragma: no cover - cancellation ends stream
                     return
 
