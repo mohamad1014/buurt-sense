@@ -133,6 +133,8 @@ def test_session_events_stream_provides_live_updates(client: TestClient) -> None
     """The SSE endpoint should emit snapshots for lifecycle changes."""
 
     with client.stream("GET", "/sessions/events") as stream:
+        assert stream.status_code == 200
+        assert stream.headers.get("content-type", "").startswith("text/event-stream")
         snapshots = stream.iter_lines()
 
         initial = _read_sse_snapshot(snapshots, timeout=2.0)
