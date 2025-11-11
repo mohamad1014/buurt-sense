@@ -11,7 +11,6 @@ from uuid import UUID
 from fastapi import (
     FastAPI,
     HTTPException,
-    Request,
     WebSocket,
     WebSocketDisconnect,
     status,
@@ -74,7 +73,7 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
         return await store.list()
 
     @app.get("/sessions/events")
-    async def session_events(request: Request) -> StreamingResponse:
+    async def session_events() -> StreamingResponse:
         """Stream session snapshots using the Server-Sent Events protocol."""
 
         async def event_generator():
@@ -85,9 +84,6 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
                             [session.to_dict() for session in sessions]
                         )
                         yield f"data: {payload}\n\n"
-
-                        if await request.is_disconnected():
-                            break
                 except asyncio.CancelledError:  # pragma: no cover - cancellation ends stream
                     return
 
