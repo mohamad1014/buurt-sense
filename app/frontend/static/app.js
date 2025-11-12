@@ -146,7 +146,11 @@ async function startSession() {
   try {
     setStatus("Starting session…");
     startButton.disabled = true;
-    const session = await fetchJson("/sessions", { method: "POST" });
+    const session = await fetchJson("/sessions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(buildSessionPayload()),
+    });
     activeSession = session;
     renderActiveSession(session);
     toggleButtons(true);
@@ -157,6 +161,37 @@ async function startSession() {
     setStatus(`Unable to start session: ${error.message}`, "error");
     startButton.disabled = false;
   }
+}
+
+function buildSessionPayload() {
+  const now = new Date().toISOString();
+  return {
+    started_at: now,
+    operator_alias: "Browser Operator",
+    notes: "Started from local UI",
+    app_version: "web-ui",
+    model_bundle_version: "demo",
+    gps_origin: {
+      lat: 52.3676,
+      lon: 4.9041,
+      accuracy_m: 5,
+      captured_at: now,
+    },
+    orientation_origin: {
+      heading_deg: 0,
+      captured_at: now,
+    },
+    config_snapshot: {
+      segment_length_sec: 30,
+      overlap_sec: 5,
+      confidence_threshold: 0.6,
+    },
+    detection_summary: {
+      total_detections: 0,
+      by_class: {},
+    },
+    redact_location: false,
+  };
 }
 
 async function stopSession() {

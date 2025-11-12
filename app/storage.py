@@ -452,14 +452,14 @@ class SessionStore:
             raise SessionAlreadyStoppedError(str(session_id))
 
         ended_at = self._now()
-        await self._backend.stop(record.id, ended_at=ended_at)
-        updated = await self._storage.end_session(
+        await self._storage.end_session(
             record.id,
             RecordingSessionUpdate(ended_at=ended_at),
         )
-        session = self._to_session(updated)
         await self._broadcast()
-        return session
+        await self._backend.stop(record.id, ended_at=ended_at)
+        final_record = await self._get_record(session_id)
+        return self._to_session(final_record)
 
     async def create_segment(
         self, session_id: UUID, payload: SegmentCreateSchema
@@ -484,6 +484,10 @@ class SessionStore:
                 start_ts=start_ts,
                 end_ts=end_ts,
                 file_path=str(encoded["file_uri"]),
+                frame_count=encoded.get("frame_count"),
+                audio_duration_ms=encoded.get("audio_duration_ms"),
+                checksum=encoded.get("checksum"),
+                size_bytes=encoded.get("size_bytes"),
                 gps_trace=list(encoded.get("gps_trace", [])),
                 orientation_trace=list(encoded.get("orientation_trace", [])),
             )
@@ -505,6 +509,10 @@ class SessionStore:
                 required=True,
             ),
             "file_path": segment.file_path,
+            "frame_count": getattr(segment, "frame_count", None),
+            "audio_duration_ms": getattr(segment, "audio_duration_ms", None),
+            "checksum": getattr(segment, "checksum", None),
+            "size_bytes": getattr(segment, "size_bytes", None),
             "gps_trace": list(getattr(segment, "gps_trace", [])),
             "orientation_trace": list(getattr(segment, "orientation_trace", [])),
         }
