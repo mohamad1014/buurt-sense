@@ -76,16 +76,57 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
     async def session_events() -> StreamingResponse:
         """Stream session snapshots using the Server-Sent Events protocol."""
 
+        heartbeat_interval = 1.0
+
         async def event_generator():
-            async with aclosing(store.subscribe()) as iterator:
-                try:
+            """Yield SSE-formatted chunks including periodic heartbeats."""
+            queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
+
+            async def offer(chunk: str) -> None:
+                """Insert ``chunk`` into the queue, dropping stale data if full."""
+                while True:
+                    try:
+                        queue.put_nowait(chunk)
+                        return
+                    except asyncio.QueueFull:
+                        try:
+                            queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            await asyncio.sleep(0)
+
+            async def pump_snapshots() -> None:
+                """Forward session snapshots from the store to the SSE queue."""
+                async with aclosing(store.subscribe()) as iterator:
                     async for sessions in iterator:
                         payload = json.dumps(
                             [session.to_dict() for session in sessions]
                         )
-                        yield f"data: {payload}\n\n"
-                except asyncio.CancelledError:  # pragma: no cover - cancellation ends stream
+                        await offer(f"data: {payload}\n\n")
+
+            async def send_heartbeats() -> None:
+                """Emit comment heartbeats so clients observe stream activity."""
+                try:
+                    while True:
+                        await asyncio.sleep(heartbeat_interval)
+                        await offer(": heartbeat\n\n")
+                except asyncio.CancelledError:  # pragma: no cover - ends heartbeat loop
                     return
+
+            snapshot_task = asyncio.create_task(pump_snapshots())
+            heartbeat_task = asyncio.create_task(send_heartbeats())
+
+            try:
+                while True:
+                    chunk = await queue.get()
+                    yield chunk
+            except asyncio.CancelledError:  # pragma: no cover - cancellation ends stream
+                return
+            finally:
+                snapshot_task.cancel()
+                heartbeat_task.cancel()
+                await asyncio.gather(
+                    snapshot_task, heartbeat_task, return_exceptions=True
+                )
 
         headers = {"Cache-Control": "no-store", "Connection": "keep-alive"}
         return StreamingResponse(

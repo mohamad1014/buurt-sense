@@ -8,7 +8,6 @@ import time
 from collections.abc import Iterator
 from uuid import uuid4
 
-import httpx
 from fastapi.testclient import TestClient
 
 from app.models import Session
@@ -111,8 +110,6 @@ def _read_sse_snapshot(
     while time.monotonic() < deadline:
         try:
             line = next(lines)
-        except httpx.ReadTimeout as exc:  # pragma: no cover - exercised in integration
-            raise AssertionError("Timed out waiting for SSE payload") from exc
         except StopIteration as exc:  # pragma: no cover - defensive guard
             raise AssertionError("SSE stream ended unexpectedly") from exc
 
@@ -135,8 +132,7 @@ def _read_sse_snapshot(
 def test_session_events_stream_provides_live_updates(client: TestClient) -> None:
     """The SSE endpoint should emit snapshots for lifecycle changes."""
 
-    timeout = httpx.Timeout(5.0)
-    with client.stream("GET", "/sessions/events", timeout=timeout) as stream:
+    with client.stream("GET", "/sessions/events") as stream:
         assert stream.status_code == 200
         assert stream.headers.get("content-type", "").startswith("text/event-stream")
         snapshots = stream.iter_lines()
