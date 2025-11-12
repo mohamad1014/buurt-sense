@@ -192,15 +192,7 @@ class PaginatedDetections(BaseModel):
     offset: int
 
 
-class SessionDetail(BaseModel):
-    id: uuid.UUID
-    started_at: datetime
-    ended_at: Optional[datetime] = None
-    device_info: Optional[Dict[str, Any]] = None
-    gps_origin: GPSOrigin
-    orientation_origin: Optional[OrientationOrigin] = None
-    config_snapshot: ConfigSnapshot
-    detection_summary: Optional[DetectionSummary] = None
+class SessionDetail(SessionRead):
     segments: List[SegmentRead] = Field(default_factory=list)
     detections: List[DetectionRead] = Field(default_factory=list)
 

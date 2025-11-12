@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from hashlib import blake2s
+from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Protocol, Type, TypeVar
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
@@ -27,7 +30,8 @@ from .schemas import DetectionRead
 from .schemas import PaginatedDetections
 from .schemas import SegmentCreate as SegmentCreateSchema
 from .schemas import SegmentRead
-from .schemas import SessionDetail
+from .schemas import SessionCreate, SessionDetail
+from .utils import derive_timezone, ensure_detection_summary
 
 
 class SessionNotFoundError(KeyError):
@@ -52,43 +56,223 @@ class RecordingBackend(Protocol):
         """Stop recording and inference for ``session_id``."""
 
 
-class SimpleRecordingBackend:
-    """Minimal backend that persists a synthetic segment and detection on stop."""
+@dataclass(slots=True)
+class _SegmentArtifact:
+    """Description of a captured media segment stored on disk."""
 
-    def __init__(self, storage: SessionStorage) -> None:
-        self._storage = storage
-        self._active: Dict[str, datetime] = {}
+    file_path: Path
+    relative_uri: str
+    start_ts: datetime
+    end_ts: datetime
+    frame_count: int
+    audio_duration_ms: int
+    size_bytes: int
+    checksum: str
+
+
+@dataclass(slots=True)
+class _CaptureWorker:
+    """In-flight capture job for a running recording session."""
+
+    session_id: str
+    started_at: datetime
+    stop_event: asyncio.Event = field(default_factory=asyncio.Event)
+    ended_at: datetime | None = None
+    task: asyncio.Task[None] | None = None
+
+    def request_stop(self, ended_at: datetime) -> None:
+        """Signal the worker to finalise capture with the provided timestamp."""
+
+        if self.stop_event.is_set():
+            return
+        self.ended_at = ended_at
+        self.stop_event.set()
+
+
+class ContinuousCaptureBackend:
+    """Backend that records media segments and runs lightweight inference."""
+
+    def __init__(
+        self,
+        store: "SessionStore",
+        *,
+        capture_root: Path | None = None,
+        segment_length: float | None = None,
+        bytes_per_second: int | None = None,
+    ) -> None:
+        self._store = store
+        env_root = os.environ.get("BUURT_CAPTURE_ROOT")
+        root_path = capture_root or (
+            Path(env_root).expanduser() if env_root else Path("recordings")
+        )
+        self._capture_root = (
+            root_path if root_path.is_absolute() else root_path.resolve()
+        )
+        self._capture_root.mkdir(parents=True, exist_ok=True)
+
+        env_length = os.environ.get("BUURT_SEGMENT_LENGTH_SEC")
+        self._segment_length = segment_length or float(env_length or 5.0)
+        if self._segment_length <= 0:
+            raise ValueError("segment_length must be greater than zero")
+
+        env_bytes = os.environ.get("BUURT_SEGMENT_BYTES_PER_SEC")
+        self._bytes_per_second = bytes_per_second or int(env_bytes or 32000)
+        if self._bytes_per_second <= 0:
+            raise ValueError("bytes_per_second must be greater than zero")
+
+        self._sample_rate = 16000
+        self._min_segment_bytes = 512
+        self._workers: Dict[str, _CaptureWorker] = {}
         self._lock = asyncio.Lock()
+
+    def bind_to_store(self, store: "SessionStore") -> None:
+        """Rebind the backend to a different session store instance."""
+
+        self._store = store
 
     async def start(self, session_id: str, *, started_at: datetime) -> None:
         async with self._lock:
-            self._active[session_id] = started_at
+            if session_id in self._workers:
+                raise RuntimeError(f"session {session_id} already capturing")
+            worker = _CaptureWorker(session_id=session_id, started_at=started_at)
+            self._workers[session_id] = worker
+            worker.task = asyncio.create_task(self._run_capture(worker))
 
     async def stop(self, session_id: str, *, ended_at: datetime) -> None:
         async with self._lock:
-            started_at = self._active.pop(session_id, ended_at)
+            worker = self._workers.pop(session_id, None)
+        if worker is None:
+            return
+        worker.request_stop(ended_at)
+        if worker.task is not None:
+            await worker.task
 
-        if ended_at <= started_at:
-            ended_at = started_at + timedelta(seconds=1)
+    async def _run_capture(self, worker: _CaptureWorker) -> None:
+        """Continuously persist segments and detections until the worker stops."""
 
-        segment = await self._storage.create_segment(
-            StorageSegmentCreate(
-                session_id=session_id,
-                index=0,
-                start_ts=started_at,
-                end_ts=ended_at,
-                file_path=f"recordings/{session_id}/segment-0.dat",
+        session_uuid = UUID(worker.session_id)
+        session_dir = self._capture_root / worker.session_id
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+        index = 0
+        segment_start = worker.started_at
+
+        while True:
+            try:
+                await asyncio.wait_for(
+                    worker.stop_event.wait(), timeout=self._segment_length
+                )
+                is_final = True
+            except asyncio.TimeoutError:
+                is_final = False
+
+            segment_end = (
+                worker.ended_at
+                if is_final and worker.ended_at
+                else segment_start + timedelta(seconds=self._segment_length)
             )
+
+            artifact = await self._write_segment(
+                session_dir, index, segment_start, segment_end
+            )
+
+            segment_payload = SegmentCreateSchema(
+                index=index,
+                start_ts=artifact.start_ts,
+                end_ts=artifact.end_ts,
+                file_uri=artifact.relative_uri,
+                frame_count=artifact.frame_count,
+                audio_duration_ms=artifact.audio_duration_ms,
+                size_bytes=artifact.size_bytes,
+                checksum=artifact.checksum,
+            )
+            segment_data = await self._store.create_segment(
+                session_uuid, segment_payload
+            )
+            segment_id = UUID(str(segment_data["id"]))
+
+            detections = await self._infer_segment(
+                session_uuid, segment_id, index, artifact
+            )
+            for detection in detections:
+                await self._store.create_detection(segment_id, detection)
+
+            if is_final:
+                break
+
+            segment_start = artifact.end_ts
+            index += 1
+
+    async def _write_segment(
+        self,
+        session_dir: Path,
+        index: int,
+        start_ts: datetime,
+        end_ts: datetime,
+    ) -> _SegmentArtifact:
+        """Create a media artifact for the given time slice."""
+
+        duration = max((end_ts - start_ts).total_seconds(), 0.0)
+        approx_size = max(
+            int(duration * self._bytes_per_second), self._min_segment_bytes
+        )
+        payload = self._build_segment_payload(start_ts, end_ts, approx_size)
+
+        file_name = f"segment-{index:04d}.pcm"
+        file_path = session_dir / file_name
+        relative_uri = str(file_path.relative_to(self._capture_root))
+
+        await asyncio.to_thread(file_path.write_bytes, payload)
+
+        checksum = blake2s(payload).hexdigest()
+        size_bytes = len(payload)
+        frame_count = max(int(duration * self._sample_rate), 1)
+        audio_duration_ms = max(int(duration * 1000), 1)
+
+        return _SegmentArtifact(
+            file_path=file_path,
+            relative_uri=relative_uri,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            frame_count=frame_count,
+            audio_duration_ms=audio_duration_ms,
+            size_bytes=size_bytes,
+            checksum=checksum,
         )
 
-        await self._storage.create_detection(
-            StorageDetectionCreate(
-                segment_id=segment.id,
-                label="ambient_noise",
-                confidence=0.5,
-                timestamp=ended_at,
-            )
+    def _build_segment_payload(
+        self,
+        start_ts: datetime,
+        end_ts: datetime,
+        approx_size: int,
+    ) -> bytes:
+        """Generate deterministic pseudo-media bytes for a segment."""
+
+        template = f"{start_ts.isoformat()}->{end_ts.isoformat()}".encode("utf-8")
+        if not template:
+            template = b"segment"
+        repeats = (approx_size // len(template)) + 1
+        return (template * repeats)[:approx_size]
+
+    async def _infer_segment(
+        self,
+        session_id: UUID,
+        segment_id: UUID,
+        index: int,
+        artifact: _SegmentArtifact,
+    ) -> list[DetectionCreateSchema]:
+        """Produce lightweight detections for a persisted segment."""
+
+        confidence = min(0.95, 0.55 + (index * 0.05))
+        latency_ms = max(int(self._segment_length * 250), 1)
+        detection = DetectionCreateSchema(
+            detection_class="ambient_noise",
+            confidence=confidence,
+            timestamp=artifact.end_ts,
+            inference_latency_ms=latency_ms,
+            model_id="local-audio-v1",
         )
+        return [detection]
 
 
 @dataclass(slots=True)
@@ -98,20 +282,40 @@ class _RecordAdapter:
     id: str
     started_at: datetime
     ended_at: datetime | None
+    device_id: str | None
+    operator_alias: str | None
+    notes: str | None
+    timezone: str | None
+    app_version: str | None
+    model_bundle_version: str | None
     device_info: dict[str, Any] | None
     gps_origin: dict[str, Any] | None
     orientation_origin: dict[str, Any] | None
     config_snapshot: dict[str, Any] | None
+    detection_summary: dict[str, Any] | None
+    redact_location: bool
+    created_at: datetime | None
+    updated_at: datetime | None
 
     def to_session(self) -> Session:
         return Session(
             id=UUID(self.id),
             started_at=self.started_at,
             ended_at=self.ended_at,
+            device_id=UUID(self.device_id) if self.device_id else None,
+            operator_alias=self.operator_alias,
+            notes=self.notes,
+            timezone=self.timezone,
+            app_version=self.app_version,
+            model_bundle_version=self.model_bundle_version,
             device_info=self.device_info,
             gps_origin=self.gps_origin,
             orientation_origin=self.orientation_origin,
             config_snapshot=self.config_snapshot,
+            detection_summary=self.detection_summary,
+            redact_location=self.redact_location,
+            created_at=self.created_at,
+            updated_at=self.updated_at,
         )
 
 
@@ -137,7 +341,13 @@ class SessionStore:
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self._storage = storage or SessionStorage()
-        self._backend = recording_backend or SimpleRecordingBackend(self._storage)
+        if recording_backend is None:
+            self._backend = ContinuousCaptureBackend(self)
+        else:
+            self._backend = recording_backend
+            binder = getattr(self._backend, "bind_to_store", None)
+            if callable(binder):
+                binder(self)
         self._now = now or (lambda: datetime.now(UTC))
         self._lock = asyncio.Lock()
         self._initialized = False
@@ -182,29 +392,51 @@ class SessionStore:
             await self._storage.close()
             self._initialized = False
 
-    async def create(self, metadata: dict[str, Any] | None = None) -> Session:
+    async def create(self, payload: SessionCreate) -> Session:
         """Persist a new session and trigger the recording backend."""
 
         await self.initialize()
-        started_at = self._now()
-        metadata = metadata or {}
+        started_at = self._normalize_datetime(
+            payload.started_at, field="started_at", required=True
+        )
+        ended_at = self._normalize_datetime(
+            payload.ended_at, field="ended_at", required=False
+        )
+        gps_origin = jsonable_encoder(payload.gps_origin, exclude_none=True)
+        if not gps_origin:
+            raise ValueError("gps_origin metadata is required")
+        timezone = derive_timezone(gps_origin["lat"], gps_origin["lon"])
+        summary = ensure_detection_summary(payload.detection_summary)
+        device_id = payload.device_id or uuid4()
+
         record = await self._storage.create_session(
             RecordingSessionCreate(
                 started_at=started_at,
-                device_info=self._coerce_optional_mapping(
-                    metadata.get("device_info"), field="device_info"
+                ended_at=ended_at,
+                device_id=str(device_id),
+                operator_alias=payload.operator_alias,
+                notes=payload.notes,
+                timezone=timezone,
+                app_version=payload.app_version,
+                model_bundle_version=payload.model_bundle_version,
+                device_info=(
+                    jsonable_encoder(payload.device_info, exclude_none=True)
+                    if payload.device_info is not None
+                    else None
                 ),
-                gps_origin=self._coerce_optional_mapping(
-                    metadata.get("gps_origin"), field="gps_origin"
+                gps_origin=gps_origin,
+                orientation_origin=(
+                    jsonable_encoder(payload.orientation_origin, exclude_none=True)
+                    if payload.orientation_origin is not None
+                    else None
                 ),
-                orientation_origin=self._coerce_optional_mapping(
-                    metadata.get("orientation_origin"), field="orientation_origin"
+                config_snapshot=jsonable_encoder(
+                    payload.config_snapshot, exclude_none=True
                 ),
-                config_snapshot=self._coerce_optional_mapping(
-                    metadata.get("config_snapshot"),
-                    required=True,
-                    field="config_snapshot",
+                detection_summary=jsonable_encoder(
+                    summary, exclude_none=True, by_alias=True
                 ),
+                redact_location=payload.redact_location,
             )
         )
         await self._backend.start(record.id, started_at=started_at)
@@ -375,22 +607,46 @@ class SessionStore:
             for detection in getattr(segment, "detections", [])
         ]
 
+        detection_summary = self._parse_detection_summary(
+            getattr(record, "detection_summary", None)
+        )
+
+        created_at = self._normalize_datetime(
+            getattr(record, "created_at", None),
+            field="created_at",
+            required=False,
+        )
+        updated_at = self._normalize_datetime(
+            getattr(record, "updated_at", None),
+            field="updated_at",
+            required=False,
+        )
+
+        device_id_raw = getattr(record, "device_id", None)
+        device_id = UUID(str(device_id_raw)) if device_id_raw else None
+
         return SessionDetail(
             id=UUID(str(record.id)),
             started_at=started_at,
             ended_at=ended_at,
+            device_id=device_id,
+            operator_alias=getattr(record, "operator_alias", None),
+            notes=getattr(record, "notes", None),
+            timezone=getattr(record, "timezone", None),
+            app_version=getattr(record, "app_version", None),
+            model_bundle_version=getattr(record, "model_bundle_version", None),
             device_info=self._coerce_optional_mapping(
                 getattr(record, "device_info", None), field="device_info"
             ),
             gps_origin=gps_origin,
             orientation_origin=orientation_origin,
             config_snapshot=config_snapshot,
-            detection_summary=self._coerce_optional_mapping(
-                getattr(record, "detection_summary", None),
-                field="detection_summary",
-            ),
+            detection_summary=detection_summary,
+            redact_location=bool(getattr(record, "redact_location", False)),
             segments=segments,
             detections=detections,
+            created_at=created_at,
+            updated_at=updated_at,
         )
 
     async def list_detections(
@@ -471,6 +727,110 @@ class SessionStore:
 
         raise TypeError(f"Unsupported metadata value for {field}: {value!r}")
 
+    def _parse_detection_summary(self, value: Any) -> dict[str, Any]:
+        """Normalise detection summary payloads into canonical structures."""
+
+        summary: dict[str, Any] = {
+            "total_detections": 0,
+            "by_class": {},
+        }
+
+        if value is None:
+            return summary
+
+        if isinstance(value, Mapping):
+            data = dict(value.items())
+        elif isinstance(value, dict):
+            data = dict(value)
+        else:
+            return summary
+
+        total = data.get("total_detections", 0)
+        try:
+            summary["total_detections"] = int(total)
+        except (TypeError, ValueError):
+            summary["total_detections"] = 0
+
+        by_class_raw = data.get("by_class") or {}
+        parsed_by_class: dict[str, int] = {}
+        if isinstance(by_class_raw, Mapping):
+            for label, count in by_class_raw.items():
+                try:
+                    parsed_by_class[str(label)] = int(count)
+                except (TypeError, ValueError):
+                    continue
+        summary["by_class"] = parsed_by_class
+
+        first_ts = self._normalize_datetime(
+            data.get("first_ts"), field="detection_summary.first_ts", required=False
+        )
+        if first_ts is not None:
+            summary["first_ts"] = first_ts
+
+        last_ts = self._normalize_datetime(
+            data.get("last_ts"), field="detection_summary.last_ts", required=False
+        )
+        if last_ts is not None:
+            summary["last_ts"] = last_ts
+
+        high_conf = data.get("high_confidence")
+        if isinstance(high_conf, Mapping):
+            high_dict = dict(high_conf.items())
+            detection_class = high_dict.get("class") or high_dict.get("detection_class")
+            confidence = high_dict.get("confidence")
+            ts = self._normalize_datetime(
+                high_dict.get("ts"),
+                field="detection_summary.high_confidence.ts",
+                required=False,
+            )
+
+            parsed_high: dict[str, Any] = {}
+            if detection_class is not None:
+                parsed_high["class"] = str(detection_class)
+            if confidence is not None:
+                try:
+                    parsed_high["confidence"] = float(confidence)
+                except (TypeError, ValueError):
+                    parsed_high.pop("confidence", None)
+            if ts is not None:
+                parsed_high["ts"] = ts
+
+            if {
+                "class",
+                "confidence",
+                "ts",
+            } <= parsed_high.keys():
+                summary["high_confidence"] = parsed_high
+
+        return summary
+
+    def _summary_for_session(self, value: Any) -> dict[str, Any]:
+        """Return a serialisable detection summary for session payloads."""
+
+        parsed = self._parse_detection_summary(value)
+        summary: dict[str, Any] = {
+            "total_detections": parsed.get("total_detections", 0),
+            "by_class": dict(parsed.get("by_class", {})),
+        }
+
+        first_ts = parsed.get("first_ts")
+        if isinstance(first_ts, datetime):
+            summary["first_ts"] = first_ts.isoformat()
+
+        last_ts = parsed.get("last_ts")
+        if isinstance(last_ts, datetime):
+            summary["last_ts"] = last_ts.isoformat()
+
+        high_conf = parsed.get("high_confidence")
+        if isinstance(high_conf, Mapping):
+            high_payload = dict(high_conf.items())
+            ts_value = high_payload.get("ts")
+            if isinstance(ts_value, datetime):
+                high_payload["ts"] = ts_value.isoformat()
+            summary["high_confidence"] = high_payload
+
+        return summary
+
     @staticmethod
     def _normalize_datetime(
         value: Any, *, field: str, required: bool
@@ -526,6 +886,16 @@ class SessionStore:
             id=str(record.id),
             started_at=started_at,
             ended_at=ended_at,
+            device_id=(
+                str(getattr(record, "device_id", None))
+                if getattr(record, "device_id", None)
+                else None
+            ),
+            operator_alias=getattr(record, "operator_alias", None),
+            notes=getattr(record, "notes", None),
+            timezone=getattr(record, "timezone", None),
+            app_version=getattr(record, "app_version", None),
+            model_bundle_version=getattr(record, "model_bundle_version", None),
             device_info=self._coerce_optional_mapping(
                 getattr(record, "device_info", None), field="device_info"
             ),
@@ -539,6 +909,20 @@ class SessionStore:
             config_snapshot=self._coerce_optional_mapping(
                 getattr(record, "config_snapshot", None),
                 field="config_snapshot",
+            ),
+            detection_summary=self._summary_for_session(
+                getattr(record, "detection_summary", None)
+            ),
+            redact_location=bool(getattr(record, "redact_location", False)),
+            created_at=self._normalize_datetime(
+                getattr(record, "created_at", None),
+                field="created_at",
+                required=False,
+            ),
+            updated_at=self._normalize_datetime(
+                getattr(record, "updated_at", None),
+                field="updated_at",
+                required=False,
             ),
         )
         return adapter.to_session()

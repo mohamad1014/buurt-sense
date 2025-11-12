@@ -27,10 +27,20 @@ class Session:
     id: UUID
     started_at: datetime
     ended_at: Optional[datetime] = None
+    device_id: Optional[UUID] = None
+    operator_alias: Optional[str] = None
+    notes: Optional[str] = None
+    timezone: Optional[str] = None
+    app_version: Optional[str] = None
+    model_bundle_version: Optional[str] = None
     device_info: Optional[Dict[str, Any]] = None
     gps_origin: Optional[Dict[str, Any]] = None
     orientation_origin: Optional[Dict[str, Any]] = None
     config_snapshot: Optional[Dict[str, Any]] = None
+    detection_summary: Optional[Dict[str, Any]] = None
+    redact_location: bool = False
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable dictionary representation."""
@@ -39,10 +49,20 @@ class Session:
             "id": str(self.id),
             "started_at": self.started_at.isoformat(),
             "ended_at": self.ended_at.isoformat() if self.ended_at else None,
+            "device_id": str(self.device_id) if self.device_id else None,
+            "operator_alias": self.operator_alias,
+            "notes": self.notes,
+            "timezone": self.timezone,
+            "app_version": self.app_version,
+            "model_bundle_version": self.model_bundle_version,
             "device_info": self.device_info,
             "gps_origin": self.gps_origin,
             "orientation_origin": self.orientation_origin,
             "config_snapshot": self.config_snapshot,
+            "detection_summary": self.detection_summary,
+            "redact_location": self.redact_location,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
 
     def model_copy(self, *, update: Mapping[str, Any] | None = None) -> "Session":
@@ -52,10 +72,20 @@ class Session:
             "id": self.id,
             "started_at": self.started_at,
             "ended_at": self.ended_at,
+            "device_id": self.device_id,
+            "operator_alias": self.operator_alias,
+            "notes": self.notes,
+            "timezone": self.timezone,
+            "app_version": self.app_version,
+            "model_bundle_version": self.model_bundle_version,
             "device_info": self.device_info,
             "gps_origin": self.gps_origin,
             "orientation_origin": self.orientation_origin,
             "config_snapshot": self.config_snapshot,
+            "detection_summary": self.detection_summary,
+            "redact_location": self.redact_location,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
         }
         if update:
             data.update(update)
@@ -82,6 +112,14 @@ class Session:
         raise TypeError(f"Unsupported UUID value: {value!r}")
 
     @classmethod
+    def _parse_optional_uuid(cls, value: Any | None) -> UUID | None:
+        """Parse optional UUID-like values."""
+
+        if value is None:
+            return None
+        return cls._parse_uuid(value)
+
+    @classmethod
     def model_validate(cls, payload: Mapping[str, Any]) -> "Session":
         """Construct a Session from a mapping payload."""
 
@@ -92,10 +130,28 @@ class Session:
             ended_at=(
                 cls._parse_datetime(data["ended_at"]) if data.get("ended_at") else None
             ),
+            device_id=cls._parse_optional_uuid(data.get("device_id")),
+            operator_alias=data.get("operator_alias"),
+            notes=data.get("notes"),
+            timezone=data.get("timezone"),
+            app_version=data.get("app_version"),
+            model_bundle_version=data.get("model_bundle_version"),
             device_info=data.get("device_info"),
             gps_origin=data.get("gps_origin"),
             orientation_origin=data.get("orientation_origin"),
             config_snapshot=data.get("config_snapshot"),
+            detection_summary=data.get("detection_summary"),
+            redact_location=bool(data.get("redact_location", False)),
+            created_at=(
+                cls._parse_datetime(data["created_at"])
+                if data.get("created_at")
+                else None
+            ),
+            updated_at=(
+                cls._parse_datetime(data["updated_at"])
+                if data.get("updated_at")
+                else None
+            ),
         )
 
     @classmethod

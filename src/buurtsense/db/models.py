@@ -7,6 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Float,
     ForeignKey,
@@ -14,6 +15,7 @@ from sqlalchemy import (
     JSON,
     String,
     UniqueConstraint,
+    func,
 )
 from sqlalchemy.ext.mutable import MutableDict, MutableList
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -33,6 +35,16 @@ class RecordingSession(Base):
         DateTime(timezone=True), nullable=False
     )
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    device_id: Mapped[str] = mapped_column(
+        String(36), nullable=False, default=lambda: str(uuid4())
+    )
+    operator_alias: Mapped[str | None] = mapped_column(String(64))
+    notes: Mapped[str | None] = mapped_column(String(500))
+    timezone: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="UTC", server_default="UTC"
+    )
+    app_version: Mapped[str | None] = mapped_column(String(64))
+    model_bundle_version: Mapped[str | None] = mapped_column(String(64))
     device_info: Mapped[dict[str, Any] | None] = mapped_column(
         MutableDict.as_mutable(JSON)
     )
@@ -44,6 +56,24 @@ class RecordingSession(Base):
     )
     config_snapshot: Mapped[dict[str, Any] | None] = mapped_column(
         MutableDict.as_mutable(JSON)
+    )
+    detection_summary: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON),
+        nullable=False,
+        default=dict,
+        server_default="{}",
+    )
+    redact_location: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
     )
 
     segments: Mapped[list["Segment"]] = relationship(

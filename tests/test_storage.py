@@ -1,7 +1,8 @@
 """Tests for the session store conversion helpers."""
+
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 from uuid import uuid4
@@ -31,6 +32,11 @@ def test_to_session_normalizes_naive_datetimes() -> None:
 
     assert session.started_at.tzinfo is UTC
     assert session.started_at.hour == 12
+    assert session.detection_summary == {
+        "total_detections": 0,
+        "by_class": {},
+    }
+    assert session.redact_location is False
 
 
 def test_to_session_parses_iso_strings() -> None:
@@ -50,6 +56,10 @@ def test_to_session_parses_iso_strings() -> None:
     assert session.started_at.tzinfo is UTC
     assert session.ended_at is not None and session.ended_at.tzinfo is UTC
     assert session.ended_at.minute == 45
+    assert session.detection_summary == {
+        "total_detections": 0,
+        "by_class": {},
+    }
 
 
 def test_to_session_requires_started_at_value() -> None:
@@ -60,3 +70,37 @@ def test_to_session_requires_started_at_value() -> None:
 
     with pytest.raises(ValueError):
         store._to_session(record)
+
+
+def test_to_session_serializes_detection_summary() -> None:
+    """Detection summaries should be normalised for session responses."""
+
+    store = _make_store()
+    started_at = datetime(2024, 1, 1, 12, 0, tzinfo=UTC)
+    later = started_at + timedelta(seconds=5)
+    record = SimpleNamespace(
+        id=str(uuid4()),
+        started_at=started_at,
+        detection_summary={
+            "total_detections": "2",
+            "by_class": {"gunshot": "2"},
+            "first_ts": started_at.isoformat(),
+            "last_ts": later.isoformat(),
+            "high_confidence": {
+                "class": "gunshot",
+                "confidence": "0.97",
+                "ts": started_at.isoformat(),
+            },
+        },
+    )
+
+    session = store._to_session(record)
+    summary = session.detection_summary or {}
+
+    assert summary["total_detections"] == 2
+    assert summary["by_class"] == {"gunshot": 2}
+    assert summary["first_ts"] == started_at.isoformat()
+    assert summary["last_ts"] == later.isoformat()
+    assert summary["high_confidence"]["class"] == "gunshot"
+    assert summary["high_confidence"]["confidence"] == 0.97
+    assert summary["high_confidence"]["ts"] == started_at.isoformat()
