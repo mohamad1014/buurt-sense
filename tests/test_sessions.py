@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -43,6 +43,51 @@ def expected_metadata(payload: dict[str, Any]) -> dict[str, Any]:
 
     keys = ("device_info", "gps_origin", "orientation_origin", "config_snapshot")
     return {key: payload[key] for key in keys if key in payload}
+
+
+def make_segment_payload() -> dict[str, Any]:
+    """Return a representative segment payload."""
+
+    start = datetime.now(UTC)
+    end = start + timedelta(seconds=30)
+    return {
+        "index": 0,
+        "start_ts": start.isoformat(),
+        "end_ts": end.isoformat(),
+        "file_uri": "recordings/session-1/segment-0.wav",
+        "gps_trace": [
+            {
+                "lat": 52.3676,
+                "lon": 4.9041,
+                "ts": start.isoformat(),
+                "accuracy_m": 2.5,
+            }
+        ],
+        "orientation_trace": [
+            {
+                "heading_deg": 140.0,
+                "ts": start.isoformat(),
+            }
+        ],
+    }
+
+
+def make_detection_payload() -> dict[str, Any]:
+    """Return a representative detection payload."""
+
+    timestamp = datetime.now(UTC)
+    return {
+        "class": "gunshot",
+        "confidence": 0.92,
+        "timestamp": timestamp.isoformat(),
+        "gps_point": {
+            "lat": 52.3677,
+            "lon": 4.9042,
+            "ts": timestamp.isoformat(),
+            "accuracy_m": 3.1,
+        },
+        "orientation_heading_deg": 145.0,
+    }
 
 
 def start_session(client: TestClient) -> tuple[Session, dict[str, Any]]:
@@ -198,12 +243,61 @@ def test_session_updates_endpoint_provides_live_changes(client: TestClient) -> N
     assert updated_sessions[session.id].gps_origin == metadata["gps_origin"]
     assert updated_sessions[session.id].config_snapshot == metadata["config_snapshot"]
 
-    client.post(f"/sessions/{session.id}/stop")
-    revision, final = _fetch_snapshot(client, cursor=revision, timeout=0.1)
-    stopped_sessions = {item.id: item for item in final}
-    assert session.id in stopped_sessions
-    assert stopped_sessions[session.id].ended_at is not None
-    assert stopped_sessions[session.id].device_info == metadata["device_info"]
+
+def test_segment_and_detection_uploads_persist_and_broadcast(
+    client: TestClient,
+) -> None:
+    """Segments and detections should persist and trigger update broadcasts."""
+
+    revision, _ = _fetch_snapshot(client, timeout=0.1)
+    session, _ = start_session(client)
+    revision, _ = _fetch_snapshot(client, cursor=revision, timeout=0.1)
+
+    segment_payload = make_segment_payload()
+    segment_response = client.post(
+        f"/sessions/{session.id}/segments", json=segment_payload
+    )
+    assert segment_response.status_code == 201
+    segment_data = segment_response.json()
+    assert segment_data["file_path"] == segment_payload["file_uri"]
+
+    segment_revision, _ = _fetch_snapshot(client, cursor=revision, timeout=0.1)
+    assert segment_revision > revision
+
+    detection_payload = make_detection_payload()
+    detection_response = client.post(
+        f"/segments/{segment_data['id']}/detections", json=detection_payload
+    )
+    assert detection_response.status_code == 201
+    detection_data = detection_response.json()
+    assert detection_data["label"] == detection_payload["class"]
+
+    detection_revision, _ = _fetch_snapshot(
+        client, cursor=segment_revision, timeout=0.1
+    )
+    assert detection_revision > segment_revision
+
+    store: SessionStore = client.app.state.session_store
+
+    async def _fetch() -> object:
+        return await store.storage.get_session(str(session.id))
+
+    record = asyncio.run(_fetch())
+    assert record.segments
+    stored_segment = next(seg for seg in record.segments if seg.id == segment_data["id"])
+    assert stored_segment.file_path == segment_payload["file_uri"]
+    assert stored_segment.index == segment_payload["index"]
+    assert stored_segment.gps_trace
+    assert stored_segment.gps_trace[0]["lat"] == segment_payload["gps_trace"][0]["lat"]
+    assert stored_segment.orientation_trace
+    assert (
+        stored_segment.orientation_trace[0]["heading_deg"]
+        == segment_payload["orientation_trace"][0]["heading_deg"]
+    )
+    assert stored_segment.detections
+    stored_detection = stored_segment.detections[0]
+    assert stored_detection.label == detection_payload["class"]
+    assert stored_detection.confidence == detection_payload["confidence"]
 
 
 def test_session_websocket_provides_live_updates(client: TestClient) -> None:

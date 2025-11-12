@@ -9,16 +9,20 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Dict, Mapping, Protocol
 from uuid import UUID
 
+from fastapi.encoders import jsonable_encoder
+
 from buurtsense.storage import (
-    DetectionCreate,
+    DetectionCreate as StorageDetectionCreate,
     RecordingSessionCreate,
     RecordingSessionUpdate,
-    SegmentCreate,
+    SegmentCreate as StorageSegmentCreate,
     SessionStorage,
 )
 from sqlalchemy.exc import NoResultFound
 
 from .models import Session
+from .schemas import DetectionCreate as DetectionCreateSchema
+from .schemas import SegmentCreate as SegmentCreateSchema
 
 
 class SessionNotFoundError(KeyError):
@@ -27,6 +31,10 @@ class SessionNotFoundError(KeyError):
 
 class SessionAlreadyStoppedError(RuntimeError):
     """Raised when attempting to stop a session that already has an end timestamp."""
+
+
+class SegmentNotFoundError(KeyError):
+    """Raised when a segment identifier is unknown to the store."""
 
 
 class RecordingBackend(Protocol):
@@ -59,7 +67,7 @@ class SimpleRecordingBackend:
             ended_at = started_at + timedelta(seconds=1)
 
         segment = await self._storage.create_segment(
-            SegmentCreate(
+            StorageSegmentCreate(
                 session_id=session_id,
                 index=0,
                 start_ts=started_at,
@@ -69,7 +77,7 @@ class SimpleRecordingBackend:
         )
 
         await self._storage.create_detection(
-            DetectionCreate(
+            StorageDetectionCreate(
                 segment_id=segment.id,
                 label="ambient_noise",
                 confidence=0.5,
@@ -213,6 +221,102 @@ class SessionStore:
         await self._broadcast()
         return session
 
+    async def create_segment(
+        self, session_id: UUID, payload: SegmentCreateSchema
+    ) -> dict[str, Any]:
+        """Persist a new segment for a session and broadcast the update."""
+
+        record = await self._get_record(session_id)
+        encoded = jsonable_encoder(payload)
+        start_ts = self._normalize_datetime(
+            encoded.get("start_ts"), field="start_ts", required=True
+        )
+        end_ts = self._normalize_datetime(
+            encoded.get("end_ts"), field="end_ts", required=True
+        )
+        if encoded.get("file_uri") is None:
+            raise ValueError("file_uri is required for segment creation")
+
+        segment = await self._storage.create_segment(
+            StorageSegmentCreate(
+                session_id=record.id,
+                index=int(encoded.get("index", 0)),
+                start_ts=start_ts,
+                end_ts=end_ts,
+                file_path=str(encoded["file_uri"]),
+                gps_trace=list(encoded.get("gps_trace", [])),
+                orientation_trace=list(encoded.get("orientation_trace", [])),
+            )
+        )
+
+        await self._broadcast()
+        return {
+            "id": segment.id,
+            "session_id": segment.session_id,
+            "index": segment.index,
+            "start_ts": self._normalize_datetime(
+                getattr(segment, "start_ts", start_ts),
+                field="start_ts",
+                required=True,
+            ),
+            "end_ts": self._normalize_datetime(
+                getattr(segment, "end_ts", end_ts),
+                field="end_ts",
+                required=True,
+            ),
+            "file_path": segment.file_path,
+            "gps_trace": list(getattr(segment, "gps_trace", [])),
+            "orientation_trace": list(
+                getattr(segment, "orientation_trace", [])
+            ),
+        }
+
+    async def create_detection(
+        self, segment_id: UUID, payload: DetectionCreateSchema
+    ) -> dict[str, Any]:
+        """Persist a detection for an existing segment and broadcast the update."""
+
+        segment = await self._get_segment(segment_id)
+        encoded = jsonable_encoder(payload)
+        timestamp = self._normalize_datetime(
+            encoded.get("timestamp"), field="timestamp", required=True
+        )
+        label = getattr(payload, "detection_class", None) or encoded.get(
+            "detection_class"
+        )
+        if label is None:
+            raise ValueError("detection_class is required for detection creation")
+
+        detection = await self._storage.create_detection(
+            StorageDetectionCreate(
+                segment_id=segment.id,
+                label=str(label),
+                confidence=float(encoded.get("confidence", 0.0)),
+                timestamp=timestamp,
+                gps_point=encoded.get("gps_point"),
+                orientation=(
+                    {"heading_deg": encoded["orientation_heading_deg"]}
+                    if encoded.get("orientation_heading_deg") is not None
+                    else None
+                ),
+            )
+        )
+
+        await self._broadcast()
+        return {
+            "id": detection.id,
+            "segment_id": detection.segment_id,
+            "label": detection.label,
+            "confidence": detection.confidence,
+            "timestamp": self._normalize_datetime(
+                getattr(detection, "timestamp", timestamp),
+                field="timestamp",
+                required=True,
+            ),
+            "gps_point": detection.gps_point,
+            "orientation": detection.orientation,
+        }
+
     async def get(self, session_id: UUID) -> Session:
         """Fetch a single session by identifier."""
 
@@ -256,6 +360,15 @@ class SessionStore:
             raise SessionNotFoundError(str(session_id)) from exc
         except KeyError as exc:  # pragma: no cover - secondary guard
             raise SessionNotFoundError(str(session_id)) from exc
+
+    async def _get_segment(self, segment_id: UUID) -> Any:
+        await self.initialize()
+        try:
+            return await self._storage.get_segment(str(segment_id))
+        except NoResultFound as exc:  # pragma: no cover - defensive guard
+            raise SegmentNotFoundError(str(segment_id)) from exc
+        except KeyError as exc:  # pragma: no cover - secondary guard
+            raise SegmentNotFoundError(str(segment_id)) from exc
 
     @staticmethod
     def _coerce_optional_mapping(

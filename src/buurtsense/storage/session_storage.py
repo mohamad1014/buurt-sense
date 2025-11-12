@@ -164,6 +164,15 @@ class SessionStorage:
             await session.refresh(detection)
             return detection
 
+    async def get_segment(self, segment_id: str) -> Segment:
+        """Retrieve a segment by identifier."""
+
+        async with self.sessionmaker() as session:
+            result = await session.execute(
+                select(Segment).where(Segment.id == segment_id)
+            )
+            return result.scalar_one()
+
     async def get_session(self, session_id: str) -> RecordingSession:
         """Retrieve a session and its related data."""
 

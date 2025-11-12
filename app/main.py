@@ -21,12 +21,13 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from .models import Session
-from .schemas import SessionCreate
+from .schemas import DetectionCreate, SegmentCreate, SessionCreate
 from .storage import (
     SessionAlreadyStoppedError,
     SessionNotFoundError,
     SessionSnapshot,
     SessionStore,
+    SegmentNotFoundError,
 )
 
 FRONTEND_DIR = Path(__file__).parent / "frontend"
@@ -102,6 +103,52 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
         metadata["config_snapshot"] = jsonable_encoder(payload.config_snapshot)
 
         return await store.create(metadata=metadata)
+
+    @app.post(
+        "/sessions/{session_id}/segments", status_code=status.HTTP_201_CREATED
+    )
+    async def create_segment(
+        session_id: UUID, payload: SegmentCreate
+    ) -> dict[str, Any]:
+        """Persist a new segment for a session."""
+
+        try:
+            segment = await store.create_segment(session_id, payload)
+        except SessionNotFoundError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Session not found",
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+        return jsonable_encoder(segment)
+
+    @app.post(
+        "/segments/{segment_id}/detections", status_code=status.HTTP_201_CREATED
+    )
+    async def create_detection(
+        segment_id: UUID, payload: DetectionCreate
+    ) -> dict[str, Any]:
+        """Persist a detection for an existing segment."""
+
+        try:
+            detection = await store.create_detection(segment_id, payload)
+        except SegmentNotFoundError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Segment not found",
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+        return jsonable_encoder(detection)
 
     @app.get("/sessions")
     async def list_sessions() -> list[Session]:
