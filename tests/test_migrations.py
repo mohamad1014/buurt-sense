@@ -32,3 +32,22 @@ async def test_alembic_migrations_initialize_schema(tmp_path: Path) -> None:
         await engine.dispose()
 
     assert {"recording_sessions", "segments", "detections"}.issubset(set(tables))
+
+
+@pytest.mark.asyncio
+async def test_init_db_can_run_multiple_times(tmp_path: Path) -> None:
+    """Applying migrations repeatedly should be safe for occupied databases."""
+
+    db_file = tmp_path / "alembic-idempotent.db"
+    engine = create_engine(f"sqlite+aiosqlite:///{db_file}")
+
+    try:
+        await init_db(engine)
+        await init_db(engine)
+
+        async with engine.begin() as conn:
+            tables = await conn.run_sync(_list_tables)
+    finally:
+        await engine.dispose()
+
+    assert {"recording_sessions", "segments", "detections"}.issubset(set(tables))

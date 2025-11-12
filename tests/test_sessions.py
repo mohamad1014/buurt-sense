@@ -52,6 +52,39 @@ def make_session_payload() -> dict[str, Any]:
     }
 
 
+def make_frontend_payload() -> dict[str, Any]:
+    """Mirror the payload produced by the browser control panel."""
+
+    now = datetime.now(UTC).isoformat()
+    return {
+        "started_at": now,
+        "operator_alias": "Browser Operator",
+        "notes": "Started from local UI",
+        "app_version": "web-ui",
+        "model_bundle_version": "demo",
+        "gps_origin": {
+            "lat": 52.3676,
+            "lon": 4.9041,
+            "accuracy_m": 5,
+            "captured_at": now,
+        },
+        "orientation_origin": {
+            "heading_deg": 0,
+            "captured_at": now,
+        },
+        "config_snapshot": {
+            "segment_length_sec": 30,
+            "overlap_sec": 5,
+            "confidence_threshold": 0.6,
+        },
+        "detection_summary": {
+            "total_detections": 0,
+            "by_class": {},
+        },
+        "redact_location": False,
+    }
+
+
 def expected_metadata(payload: dict[str, Any]) -> dict[str, Any]:
     """Return the subset of payload fields persisted alongside sessions."""
 
@@ -197,6 +230,21 @@ def test_session_lifecycle(client: TestClient) -> None:
     assert stored_session.detection_summary == summary_after_stop
 
 
+def test_frontend_payload_contract(client: TestClient) -> None:
+    """The UI payload should satisfy the API schema without manual tweaks."""
+
+    payload = make_frontend_payload()
+    response = client.post("/sessions", json=payload)
+    assert response.status_code == 201
+    payload_with_device = dict(payload)
+    payload_with_device["device_id"] = response.json()["device_id"]
+    metadata = expected_metadata(payload_with_device)
+    session = validate_session_payload(response.json(), metadata)
+    assert session.notes == payload["notes"]
+    summary = session.detection_summary or {}
+    assert summary.get("total_detections", 0) == 0
+
+
 def test_backend_stream_persists_segments_and_detections(
     client: TestClient,
 ) -> None:
@@ -231,6 +279,21 @@ def test_backend_stream_persists_segments_and_detections(
         assert file_path.stat().st_size > 0
         assert segment.get("audio_duration_ms", 0) >= 1
         assert segment.get("frame_count", 0) >= 1
+        assert segment.get("checksum"), "segment checksum should be populated"
+        assert segment.get("size_bytes", 0) > 0
+
+    store: SessionStore = client.app.state.session_store
+
+    async def _fetch() -> object:
+        return await store.storage.get_session(str(session.id))
+
+    record = asyncio.run(_fetch())
+    assert record.segments, "session should persist segments in storage"
+    db_segment = record.segments[0]
+    assert db_segment.frame_count is not None and db_segment.frame_count > 0
+    assert db_segment.audio_duration_ms is not None and db_segment.audio_duration_ms > 0
+    assert db_segment.checksum, "checksum should be stored in the database"
+    assert db_segment.size_bytes is not None and db_segment.size_bytes > 0
 
 
 def test_stopping_unknown_session_returns_not_found(client: TestClient) -> None:
@@ -565,8 +628,16 @@ def test_session_websocket_provides_live_updates(client: TestClient) -> None:
         assert created["gps_origin"] == metadata["gps_origin"]
 
         # Stop session and verify final update
+        time.sleep(0.35)
         client.post(f"/sessions/{session.id}/stop")
-        final = websocket.receive_json()
-        stopped = next(item for item in final if item["id"] == str(session.id))
-        assert stopped["ended_at"] is not None
+        stopped = None
+        for _ in range(3):
+            final = websocket.receive_json()
+            candidate = next(item for item in final if item["id"] == str(session.id))
+            if candidate["ended_at"] is not None:
+                stopped = candidate
+                break
+        assert stopped is not None and stopped["ended_at"] is not None
         assert stopped["config_snapshot"] == metadata["config_snapshot"]
+        summary = stopped.get("detection_summary") or {}
+        assert summary.get("total_detections", 0) >= 1
