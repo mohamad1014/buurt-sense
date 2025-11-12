@@ -117,6 +117,19 @@ def _fetch_snapshot(
     return payload["revision"], sessions
 
 
+def test_session_updates_accepts_none_cursor_value(client: TestClient) -> None:
+    """Explicitly passing None as cursor should be treated as no filter."""
+
+    response = client.get(
+        "/sessions/updates",
+        params={"cursor": None, "timeout": 0.0},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["revision"] == 0
+    assert payload["sessions"] == []
+
+
 def test_session_updates_endpoint_provides_live_changes(client: TestClient) -> None:
     """The updates endpoint should provide successive lifecycle snapshots."""
 

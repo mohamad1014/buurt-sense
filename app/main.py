@@ -7,7 +7,7 @@ from contextlib import aclosing, asynccontextmanager
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -20,6 +20,25 @@ from .storage import (
 )
 
 FRONTEND_DIR = Path(__file__).parent / "frontend"
+
+
+def _parse_cursor(raw_cursor: str | None) -> int | None:
+    """Convert a raw cursor query parameter into an optional integer."""
+
+    if raw_cursor is None:
+        return None
+
+    candidate = raw_cursor.strip()
+    if not candidate or candidate.lower() in {"none", "null"}:
+        return None
+
+    try:
+        return int(candidate)
+    except ValueError as exc:  # pragma: no cover - surfaced via FastAPI response
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="cursor must be an integer value",
+        ) from exc
 
 
 def create_app(session_store: SessionStore | None = None) -> FastAPI:
@@ -72,15 +91,17 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
 
     @app.get("/sessions/updates")
     async def session_updates(
-        cursor: int | None = None,
+        cursor: str | None = Query(default=None, alias="cursor"),
         timeout: float = 10.0,
     ) -> dict[str, object]:
         """Return the latest session snapshot, optionally waiting for changes."""
 
+        filter_cursor = _parse_cursor(cursor)
+
         async def wait_for_update() -> SessionSnapshot:
             async with aclosing(store.subscribe()) as iterator:
                 async for snapshot in iterator:
-                    if cursor is None or snapshot.revision > cursor:
+                    if filter_cursor is None or snapshot.revision > filter_cursor:
                         return snapshot
 
         try:
