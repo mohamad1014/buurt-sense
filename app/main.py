@@ -2,24 +2,22 @@
 
 from __future__ import annotations
 
-import json
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import aclosing, asynccontextmanager
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import (
-    FastAPI,
-    HTTPException,
-    Request,
-    WebSocket,
-    WebSocketDisconnect,
-    status,
-)
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from .models import Session
-from .storage import SessionAlreadyStoppedError, SessionNotFoundError, SessionStore
+from .storage import (
+    SessionAlreadyStoppedError,
+    SessionNotFoundError,
+    SessionSnapshot,
+    SessionStore,
+)
 
 FRONTEND_DIR = Path(__file__).parent / "frontend"
 
@@ -72,6 +70,30 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
 
         return await store.list()
 
+    @app.get("/sessions/updates")
+    async def session_updates(
+        cursor: int | None = None,
+        timeout: float = 10.0,
+    ) -> dict[str, object]:
+        """Return the latest session snapshot, optionally waiting for changes."""
+
+        async def wait_for_update() -> SessionSnapshot:
+            async with aclosing(store.subscribe()) as iterator:
+                async for snapshot in iterator:
+                    if cursor is None or snapshot.revision > cursor:
+                        return snapshot
+
+        try:
+            snapshot = await asyncio.wait_for(wait_for_update(), timeout=timeout)
+        except asyncio.TimeoutError:
+            sessions = await store.list()
+            snapshot = SessionSnapshot(store.revision, tuple(sessions))
+
+        return {
+            "revision": snapshot.revision,
+            "sessions": [session.to_dict() for session in snapshot.sessions],
+        }
+
     @app.get("/sessions/{session_id}")
     async def get_session(session_id: UUID) -> Session:
         """Retrieve a single session by identifier."""
@@ -101,30 +123,16 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
                 detail="Session already stopped",
             ) from exc
 
-    @app.get("/sessions/events")
-    async def session_events(request: Request) -> StreamingResponse:
-        """Stream session snapshots using the Server-Sent Events protocol."""
-
-        async def event_generator():
-            async for sessions in store.subscribe():
-                if await request.is_disconnected():
-                    return
-                payload = json.dumps([session.to_dict() for session in sessions])
-                yield f"data: {payload}\n\n"
-
-        headers = {"Cache-Control": "no-store", "Connection": "keep-alive"}
-        return StreamingResponse(
-            event_generator(), media_type="text/event-stream", headers=headers
-        )
-
     @app.websocket("/ws/sessions")
     async def session_websocket(websocket: WebSocket) -> None:
         """Push live session snapshots to connected websocket clients."""
 
         await websocket.accept()
         try:
-            async for sessions in store.subscribe():
-                await websocket.send_json([session.to_dict() for session in sessions])
+            async for snapshot in store.subscribe():
+                await websocket.send_json(
+                    [session.to_dict() for session in snapshot.sessions]
+                )
         except WebSocketDisconnect:  # pragma: no cover - handled by FastAPI runtime
             return
         except RuntimeError:  # pragma: no cover - defensive guard for closed sockets
