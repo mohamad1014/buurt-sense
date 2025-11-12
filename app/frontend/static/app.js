@@ -7,8 +7,9 @@ const sessionList = document.getElementById("session-list");
 
 let activeSession = null;
 let liveWebSocket = null;
-let liveEventSource = null;
 let pollingTimer = null;
+let longPollController = null;
+let lastRevision = null;
 let shuttingDown = false;
 
 function formatTimestamp(timestamp) {
@@ -129,8 +130,9 @@ async function fetchJson(url, options) {
 async function loadSessions(options = {}) {
   const announce = options.announce ?? true;
   try {
-    const sessions = await fetchJson("/sessions");
-    handleSessionSnapshot(sessions);
+    const payload = await fetchJson("/sessions/updates");
+    lastRevision = payload.revision;
+    handleSessionSnapshot(payload.sessions);
     if (announce) {
       setStatus("Session list updated.");
     }
@@ -192,6 +194,7 @@ function startPolling() {
   if (pollingTimer) {
     return;
   }
+  stopLongPolling();
   pollingTimer = window.setInterval(() => {
     loadSessions({ announce: false }).catch((error) => {
       console.error("Polling update failed", error);
@@ -199,32 +202,52 @@ function startPolling() {
   }, 10000);
 }
 
-function connectEventSource() {
-  if (!("EventSource" in window)) {
-    return false;
+function stopLongPolling() {
+  if (longPollController) {
+    longPollController.aborted = true;
+    longPollController = null;
+  }
+}
+
+async function startLongPolling() {
+  if (longPollController) {
+    return;
   }
 
-  liveEventSource = new EventSource("/sessions/events");
-  liveEventSource.onmessage = (event) => {
-    try {
-      const sessions = JSON.parse(event.data);
-      handleSessionSnapshot(sessions);
-    } catch (error) {
-      console.error("Failed to parse SSE payload", error);
+  stopPolling();
+
+  const controller = { aborted: false };
+  longPollController = controller;
+
+  const loop = async () => {
+    while (!controller.aborted) {
+      try {
+        const params = new URLSearchParams();
+        if (lastRevision !== null && lastRevision !== undefined) {
+          params.set("cursor", String(lastRevision));
+        }
+        const url = params.toString()
+          ? `/sessions/updates?${params.toString()}`
+          : "/sessions/updates";
+        const payload = await fetchJson(url);
+        lastRevision = payload.revision;
+        handleSessionSnapshot(payload.sessions);
+      } catch (error) {
+        if (controller.aborted) {
+          return;
+        }
+        console.error("Long-polling update failed", error);
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
     }
-  };
-  liveEventSource.onerror = () => {
-    if (shuttingDown) {
-      return;
-    }
-    console.warn("SSE connection lost. Falling back to polling.");
-    liveEventSource.close();
-    liveEventSource = null;
-    startPolling();
   };
 
-  stopPolling();
-  return true;
+  loop().catch((error) => {
+    if (!controller.aborted) {
+      console.error("Long-polling loop terminated unexpectedly", error);
+      startPolling();
+    }
+  });
 }
 
 function connectWebSocket() {
@@ -249,10 +272,7 @@ function connectWebSocket() {
       return;
     }
     liveWebSocket = null;
-    if (connectEventSource()) {
-      return;
-    }
-    startPolling();
+    startLongPolling();
   };
 
   liveWebSocket.onerror = () => {
@@ -262,6 +282,7 @@ function connectWebSocket() {
   };
 
   stopPolling();
+  stopLongPolling();
   return true;
 }
 
@@ -269,7 +290,8 @@ function setupLiveUpdates() {
   if (connectWebSocket()) {
     return;
   }
-  if (connectEventSource()) {
+  if ("fetch" in window) {
+    startLongPolling();
     return;
   }
   startPolling();
@@ -278,17 +300,12 @@ function setupLiveUpdates() {
 function cleanupLiveUpdates() {
   shuttingDown = true;
   stopPolling();
+  stopLongPolling();
   if (liveWebSocket) {
     const socket = liveWebSocket;
     liveWebSocket = null;
     socket.onclose = null;
     socket.close();
-  }
-  if (liveEventSource) {
-    const source = liveEventSource;
-    liveEventSource = null;
-    source.onerror = null;
-    source.close();
   }
 }
 
