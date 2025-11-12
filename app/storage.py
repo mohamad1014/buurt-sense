@@ -94,6 +94,14 @@ class _RecordAdapter:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class SessionSnapshot:
+    """Immutable payload describing the state of all sessions."""
+
+    revision: int
+    sessions: list[Session]
+
+
 class SessionStore:
     """Coordinate durable storage with recording and inference hooks."""
 
@@ -109,7 +117,8 @@ class SessionStore:
         self._now = now or (lambda: datetime.now(UTC))
         self._lock = asyncio.Lock()
         self._initialized = False
-        self._subscribers: set[asyncio.Queue[list[Session]]] = set()
+        self._revision = 0
+        self._subscribers: set[asyncio.Queue[SessionSnapshot]] = set()
         self._subscribers_lock = asyncio.Lock()
 
     @property
@@ -190,18 +199,51 @@ class SessionStore:
 
         return await self._snapshot()
 
-    async def subscribe(self) -> AsyncIterator[list[Session]]:
+    async def subscribe(self) -> AsyncIterator[SessionSnapshot]:
         """Yield session snapshots whenever the store mutates."""
 
-        queue: asyncio.Queue[list[Session]] = asyncio.Queue(maxsize=1)
+        queue: asyncio.Queue[SessionSnapshot] = asyncio.Queue(maxsize=1)
         async with self._subscribers_lock:
             self._subscribers.add(queue)
 
         try:
-            await queue.put(await self._snapshot())
+            await queue.put(await self._current_snapshot())
             while True:
-                sessions = await queue.get()
-                yield sessions
+                snapshot = await queue.get()
+                yield snapshot
+        finally:
+            async with self._subscribers_lock:
+                self._subscribers.discard(queue)
+
+    async def wait_for_update(
+        self, last_revision: int | None, *, timeout: float = 10.0
+    ) -> SessionSnapshot:
+        """Block until the session list changes or the timeout elapses."""
+
+        await self.initialize()
+        current_snapshot = await self._current_snapshot()
+        if last_revision is None or current_snapshot.revision > last_revision:
+            return current_snapshot
+
+        queue: asyncio.Queue[SessionSnapshot] = asyncio.Queue(maxsize=1)
+        async with self._subscribers_lock:
+            self._subscribers.add(queue)
+
+        try:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + max(timeout, 0.0)
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return await self._current_snapshot()
+
+                try:
+                    snapshot = await asyncio.wait_for(queue.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    return await self._current_snapshot()
+
+                if snapshot.revision > last_revision:
+                    return snapshot
         finally:
             async with self._subscribers_lock:
                 self._subscribers.discard(queue)
@@ -216,7 +258,9 @@ class SessionStore:
             raise SessionNotFoundError(str(session_id)) from exc
 
     @staticmethod
-    def _normalize_datetime(value: Any, *, field: str, required: bool) -> datetime | None:
+    def _normalize_datetime(
+        value: Any, *, field: str, required: bool
+    ) -> datetime | None:
         """
         Return a timezone-aware datetime converted to UTC.
 
@@ -237,7 +281,9 @@ class SessionStore:
             try:
                 dt = datetime.fromisoformat(value)
             except ValueError as exc:
-                raise ValueError(f"Invalid datetime string for {field}: {value}") from exc
+                raise ValueError(
+                    f"Invalid datetime string for {field}: {value}"
+                ) from exc
         else:
             raise TypeError(f"Unsupported {field} value: {value!r}")
 
@@ -277,6 +323,12 @@ class SessionStore:
         sessions = [self._to_session(record) for record in records]
         return sorted(sessions, key=lambda session: session.started_at, reverse=True)
 
+    async def _current_snapshot(self) -> SessionSnapshot:
+        """Return the latest snapshot paired with its revision number."""
+
+        sessions = await self._snapshot()
+        return SessionSnapshot(self._revision, sessions)
+
     async def _broadcast(self) -> None:
         """Push the current snapshot to all registered subscribers."""
 
@@ -284,16 +336,19 @@ class SessionStore:
         async with self._subscribers_lock:
             subscribers = list(self._subscribers)
 
+        self._revision += 1
+        snapshot = SessionSnapshot(self._revision, sessions)
+
         for queue in subscribers:
             try:
-                queue.put_nowait(sessions)
+                queue.put_nowait(snapshot)
             except asyncio.QueueFull:
                 try:
                     queue.get_nowait()
                 except asyncio.QueueEmpty:
                     pass
                 try:
-                    queue.put_nowait(sessions)
+                    queue.put_nowait(snapshot)
                 except asyncio.QueueFull:
                     # Drop the update if the subscriber is unresponsive; the next
                     # snapshot will overwrite any stale data.

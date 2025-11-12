@@ -3,12 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import time
-from collections.abc import Iterator
 from uuid import uuid4
 
-import pytest
 from fastapi.testclient import TestClient
 
 from app.models import Session
@@ -102,57 +98,45 @@ def test_stop_session_persists_backend_artifacts(client: TestClient) -> None:
     assert detections, "recording backend should persist detections for the segment"
 
 
-def _next_sse_payload(lines: Iterator[str], timeout: float = 5.0) -> list[dict] | None:
-    """Extract the next SSE payload with timeout to prevent infinite loops.
-    
-    Returns None if no payload is received within timeout or stream ends.
-    """
-    start_time = time.time()
-    try:
-        for line in lines:
-            if time.time() - start_time > timeout:
-                return None
-            
-            if not line:
-                continue
-            if line.startswith("data:"):
-                return json.loads(line.removeprefix("data:").strip())
-    except StopIteration:
-        # Stream ended
-        return None
-    return None
+def _request_snapshot(
+    client: TestClient, *, cursor: int | None = None, timeout: float = 0.0
+) -> tuple[int, list[Session]]:
+    """Fetch the latest session snapshot using the long-polling endpoint."""
+
+    response = client.get(
+        "/sessions/updates",
+        params={"cursor": cursor, "timeout": timeout},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    revision = int(payload["revision"])
+    sessions = [Session.model_validate(item) for item in payload["sessions"]]
+    return revision, sessions
 
 
-@pytest.mark.skip(reason="SSE streaming not properly supported in test environment")
-def test_session_events_stream_provides_live_updates(client: TestClient) -> None:
-    """Test that SSE stream provides real-time session updates."""
-    with client.stream("GET", "/sessions/events") as stream:
-        lines = stream.iter_lines()
-        
-        # Get initial empty payload
-        initial_payload = _next_sse_payload(lines, timeout=2.0)
-        if initial_payload is None:
-            pytest.skip("SSE stream not available in test environment")
-        
-        assert isinstance(initial_payload, list)
-        assert not initial_payload
+def test_session_updates_endpoint_provides_live_snapshots(client: TestClient) -> None:
+    """The updates endpoint should return snapshots as sessions change."""
 
-        # Create session and verify update
-        session = validate_session_payload(client.post("/sessions").json())
-        update_payload = _next_sse_payload(lines, timeout=3.0)
-        if update_payload is None:
-            pytest.skip("SSE updates not received in test environment")
-        
-        assert any(item["id"] == str(session.id) for item in update_payload)
+    revision, sessions = _request_snapshot(client)
+    assert sessions == []
 
-        # Stop session and verify final update
-        client.post(f"/sessions/{session.id}/stop")
-        final_payload = _next_sse_payload(lines, timeout=3.0)
-        if final_payload is None:
-            pytest.skip("SSE final update not received in test environment")
-        
-        stopped = next(item for item in final_payload if item["id"] == str(session.id))
-        assert stopped["ended_at"] is not None
+    session = validate_session_payload(client.post("/sessions").json())
+    update_revision, update_sessions = _request_snapshot(
+        client, cursor=revision, timeout=1.0
+    )
+    updated_map = {item.id: item for item in update_sessions}
+    assert update_revision > revision
+    assert session.id in updated_map
+    assert updated_map[session.id].ended_at is None
+
+    client.post(f"/sessions/{session.id}/stop")
+    final_revision, final_sessions = _request_snapshot(
+        client, cursor=update_revision, timeout=1.0
+    )
+    stopped_map = {item.id: item for item in final_sessions}
+    assert final_revision > update_revision
+    assert session.id in stopped_map
+    assert stopped_map[session.id].ended_at is not None
 
 
 def test_session_websocket_provides_live_updates(client: TestClient) -> None:
