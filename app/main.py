@@ -5,13 +5,23 @@ from __future__ import annotations
 import asyncio
 from contextlib import aclosing, asynccontextmanager
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Query,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from .models import Session
+from .schemas import SessionCreate
 from .storage import (
     SessionAlreadyStoppedError,
     SessionNotFoundError,
@@ -78,10 +88,20 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
         return {"status": "ok"}
 
     @app.post("/sessions", status_code=status.HTTP_201_CREATED)
-    async def create_session() -> Session:
+    async def create_session(payload: SessionCreate) -> Session:
         """Start a new recording session."""
 
-        return await store.create()
+        metadata: dict[str, Any] = {}
+        if payload.device_info is not None:
+            metadata["device_info"] = jsonable_encoder(payload.device_info)
+        metadata["gps_origin"] = jsonable_encoder(payload.gps_origin)
+        if payload.orientation_origin is not None:
+            metadata["orientation_origin"] = jsonable_encoder(
+                payload.orientation_origin
+            )
+        metadata["config_snapshot"] = jsonable_encoder(payload.config_snapshot)
+
+        return await store.create(metadata=metadata)
 
     @app.get("/sessions")
     async def list_sessions() -> list[Session]:

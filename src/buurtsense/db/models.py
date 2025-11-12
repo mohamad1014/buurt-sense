@@ -6,7 +6,15 @@ from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, JSON, String, UniqueConstraint
+from sqlalchemy import (
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    JSON,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.ext.mutable import MutableDict, MutableList
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -32,6 +40,9 @@ class RecordingSession(Base):
         MutableDict.as_mutable(JSON)
     )
     orientation_origin: Mapped[dict[str, Any] | None] = mapped_column(
+        MutableDict.as_mutable(JSON)
+    )
+    config_snapshot: Mapped[dict[str, Any] | None] = mapped_column(
         MutableDict.as_mutable(JSON)
     )
 

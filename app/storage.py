@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Callable, Dict, Protocol
+from typing import Any, Callable, Dict, Mapping, Protocol
 from uuid import UUID
 
 from buurtsense.storage import (
@@ -85,12 +85,20 @@ class _RecordAdapter:
     id: str
     started_at: datetime
     ended_at: datetime | None
+    device_info: dict[str, Any] | None
+    gps_origin: dict[str, Any] | None
+    orientation_origin: dict[str, Any] | None
+    config_snapshot: dict[str, Any] | None
 
     def to_session(self) -> Session:
         return Session(
             id=UUID(self.id),
             started_at=self.started_at,
             ended_at=self.ended_at,
+            device_info=self.device_info,
+            gps_origin=self.gps_origin,
+            orientation_origin=self.orientation_origin,
+            config_snapshot=self.config_snapshot,
         )
 
 
@@ -158,13 +166,30 @@ class SessionStore:
             await self._storage.close()
             self._initialized = False
 
-    async def create(self) -> Session:
+    async def create(self, metadata: dict[str, Any] | None = None) -> Session:
         """Persist a new session and trigger the recording backend."""
 
         await self.initialize()
         started_at = self._now()
+        metadata = metadata or {}
         record = await self._storage.create_session(
-            RecordingSessionCreate(started_at=started_at)
+            RecordingSessionCreate(
+                started_at=started_at,
+                device_info=self._coerce_optional_mapping(
+                    metadata.get("device_info"), field="device_info"
+                ),
+                gps_origin=self._coerce_optional_mapping(
+                    metadata.get("gps_origin"), field="gps_origin"
+                ),
+                orientation_origin=self._coerce_optional_mapping(
+                    metadata.get("orientation_origin"), field="orientation_origin"
+                ),
+                config_snapshot=self._coerce_optional_mapping(
+                    metadata.get("config_snapshot"),
+                    required=True,
+                    field="config_snapshot",
+                ),
+            )
         )
         await self._backend.start(record.id, started_at=started_at)
         session = self._to_session(record)
@@ -233,6 +258,25 @@ class SessionStore:
             raise SessionNotFoundError(str(session_id)) from exc
 
     @staticmethod
+    def _coerce_optional_mapping(
+        value: Any, *, required: bool = False, field: str = "metadata"
+    ) -> dict[str, Any] | None:
+        """Return a shallow copy of a mapping or ``None`` if not provided."""
+
+        if value is None:
+            if required:
+                raise ValueError(f"{field} metadata is required")
+            return None
+
+        if isinstance(value, dict):
+            return dict(value)
+
+        if isinstance(value, Mapping):
+            return dict(value.items())
+
+        raise TypeError(f"Unsupported metadata value for {field}: {value!r}")
+
+    @staticmethod
     def _normalize_datetime(
         value: Any, *, field: str, required: bool
     ) -> datetime | None:
@@ -287,6 +331,20 @@ class SessionStore:
             id=str(record.id),
             started_at=started_at,
             ended_at=ended_at,
+            device_info=self._coerce_optional_mapping(
+                getattr(record, "device_info", None), field="device_info"
+            ),
+            gps_origin=self._coerce_optional_mapping(
+                getattr(record, "gps_origin", None), field="gps_origin"
+            ),
+            orientation_origin=self._coerce_optional_mapping(
+                getattr(record, "orientation_origin", None),
+                field="orientation_origin",
+            ),
+            config_snapshot=self._coerce_optional_mapping(
+                getattr(record, "config_snapshot", None),
+                field="config_snapshot",
+            ),
         )
         return adapter.to_session()
 

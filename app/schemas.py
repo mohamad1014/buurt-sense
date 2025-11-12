@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, root_validator, validator
 
@@ -35,7 +35,11 @@ class ConfigSnapshot(BaseModel):
     def validate_overlap(cls, values: Dict[str, object]) -> Dict[str, object]:
         segment_length = values.get("segment_length_sec")
         overlap = values.get("overlap_sec")
-        if segment_length is not None and overlap is not None and overlap >= segment_length:
+        if (
+            segment_length is not None
+            and overlap is not None
+            and overlap >= segment_length
+        ):
             raise ValueError("overlap_sec must be less than segment_length_sec")
         return values
 
@@ -90,6 +94,7 @@ class SessionBase(BaseModel):
 
 class SessionCreate(SessionBase):
     device_id: Optional[uuid.UUID] = None
+    device_info: Optional[Dict[str, Any]] = None
 
 
 class SessionRead(SessionBase):

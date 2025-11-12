@@ -22,6 +22,7 @@ class RecordingSessionCreate:
     device_info: dict[str, Any] | None = None
     gps_origin: dict[str, Any] | None = None
     orientation_origin: dict[str, Any] | None = None
+    config_snapshot: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -60,7 +61,9 @@ class DetectionCreate:
 class SessionStorage:
     """Facade responsible for durable session persistence."""
 
-    def __init__(self, *, engine: AsyncEngine | None = None, db_url: str | None = None) -> None:
+    def __init__(
+        self, *, engine: AsyncEngine | None = None, db_url: str | None = None
+    ) -> None:
         if engine is None:
             self.engine = create_engine(db_url)
         else:
@@ -99,13 +102,16 @@ class SessionStorage:
                 device_info=payload.device_info,
                 gps_origin=payload.gps_origin,
                 orientation_origin=payload.orientation_origin,
+                config_snapshot=payload.config_snapshot,
             )
             session.add(record)
             await session.flush()
             await session.refresh(record)
             return record
 
-    async def end_session(self, session_id: str, payload: RecordingSessionUpdate) -> RecordingSession:
+    async def end_session(
+        self, session_id: str, payload: RecordingSessionUpdate
+    ) -> RecordingSession:
         """Mark a session as ended and optionally update device metadata."""
 
         async with session_scope(self.sessionmaker) as session:
@@ -173,7 +179,9 @@ class SessionStorage:
             )
             return result.scalar_one()
 
-    async def list_sessions(self, limit: int = 20, offset: int = 0) -> list[RecordingSession]:
+    async def list_sessions(
+        self, limit: int = 20, offset: int = 0
+    ) -> list[RecordingSession]:
         """Return a paginated list of sessions."""
 
         async with self.sessionmaker() as session:
