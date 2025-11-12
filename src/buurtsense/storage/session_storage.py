@@ -51,6 +51,10 @@ class SegmentCreate:
     start_ts: datetime
     end_ts: datetime
     file_path: str
+    frame_count: int | None = None
+    audio_duration_ms: int | None = None
+    checksum: str | None = None
+    size_bytes: int | None = None
     gps_trace: list[dict[str, Any]] | None = None
     orientation_trace: list[dict[str, Any]] | None = None
 
@@ -157,6 +161,10 @@ class SessionStorage:
                 start_ts=payload.start_ts,
                 end_ts=payload.end_ts,
                 file_path=payload.file_path,
+                frame_count=payload.frame_count,
+                audio_duration_ms=payload.audio_duration_ms,
+                checksum=payload.checksum,
+                size_bytes=payload.size_bytes,
                 gps_trace=payload.gps_trace or [],
                 orientation_trace=payload.orientation_trace or [],
             )

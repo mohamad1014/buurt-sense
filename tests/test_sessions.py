@@ -436,6 +436,18 @@ def test_session_detail_endpoint_returns_expected_payload(
     )
     assert detection_response.status_code == 201
 
+    second_detection_payload = make_detection_payload()
+    second_detection_payload["class"] = "siren"
+    second_detection_payload["confidence"] = 0.41
+    second_base_ts = datetime.fromisoformat(second_detection_payload["timestamp"])
+    second_timestamp = (second_base_ts + timedelta(seconds=5)).isoformat()
+    second_detection_payload["timestamp"] = second_timestamp
+    second_detection_payload["gps_point"]["ts"] = second_timestamp
+    second_response = passive_client.post(
+        f"/segments/{segment_data['id']}/detections", json=second_detection_payload
+    )
+    assert second_response.status_code == 201
+
     detail_response = passive_client.get(f"/sessions/{session.id}/detail")
     assert detail_response.status_code == 200
     detail = detail_response.json()

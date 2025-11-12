@@ -102,6 +102,10 @@ class Segment(Base):
     start_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     end_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     file_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    frame_count: Mapped[int | None] = mapped_column(Integer)
+    audio_duration_ms: Mapped[int | None] = mapped_column(Integer)
+    checksum: Mapped[str | None] = mapped_column(String(128))
+    size_bytes: Mapped[int | None] = mapped_column(Integer)
     gps_trace: Mapped[list[dict[str, Any]]] = mapped_column(
         MutableList.as_mutable(JSON), default=list
     )

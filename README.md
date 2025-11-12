@@ -22,6 +22,10 @@ uv run uvicorn --factory app.main:create_app --reload --host 0.0.0.0 --port 8000
 
 Once the server is running, visit `http://localhost:8000/` for the recording control panel or `http://localhost:8000/docs` for the automatically generated Swagger UI.
 
+### Browser Session Defaults
+
+The "Start session" button in the bundled UI now sends a complete JSON payload with placeholder metadata (demo operator alias, Amsterdam GPS, and default config snapshot). This keeps the UX friction-free while still satisfying the backend schema requirements. If you want the button to emit different defaults, edit `buildSessionPayload()` in `app/frontend/static/app.js` (for example to plug in real device info or GPS coordinates) or replace the UI with your own client that submits customized payloads.
+
 ### Recording Backend Configuration
 
 The default recording backend now captures media segments continuously while sessions are active and stores them on disk. Configure its behaviour with the following environment variables:
