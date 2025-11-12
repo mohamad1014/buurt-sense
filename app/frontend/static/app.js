@@ -7,7 +7,7 @@ const sessionList = document.getElementById("session-list");
 
 let activeSession = null;
 let liveWebSocket = null;
-let liveEventSource = null;
+let liveEventStreamAbort = null;
 let pollingTimer = null;
 let shuttingDown = false;
 
@@ -199,31 +199,80 @@ function startPolling() {
   }, 10000);
 }
 
-function connectEventSource() {
-  if (!("EventSource" in window)) {
+function connectEventStream() {
+  if (!("fetch" in window) || !("ReadableStream" in window)) {
     return false;
   }
 
-  liveEventSource = new EventSource("/sessions/events");
-  liveEventSource.onmessage = (event) => {
-    try {
-      const sessions = JSON.parse(event.data);
-      handleSessionSnapshot(sessions);
-    } catch (error) {
-      console.error("Failed to parse SSE payload", error);
-    }
-  };
-  liveEventSource.onerror = () => {
-    if (shuttingDown) {
-      return;
-    }
-    console.warn("SSE connection lost. Falling back to polling.");
-    liveEventSource.close();
-    liveEventSource = null;
-    startPolling();
-  };
+  if (liveEventStreamAbort) {
+    liveEventStreamAbort.abort();
+    liveEventStreamAbort = null;
+  }
 
-  stopPolling();
+  const controller = new AbortController();
+  liveEventStreamAbort = controller;
+
+  (async () => {
+    try {
+      const response = await fetch("/sessions/events", {
+        signal: controller.signal,
+        headers: { Accept: "application/x-ndjson" },
+      });
+
+      if (!response.ok || !response.body) {
+        throw new Error("Stream unavailable");
+      }
+
+      stopPolling();
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+        buffer += decoder.decode(value, { stream: true });
+
+        let newlineIndex = buffer.indexOf("\n");
+        while (newlineIndex !== -1) {
+          const rawLine = buffer.slice(0, newlineIndex).trim();
+          buffer = buffer.slice(newlineIndex + 1);
+          if (rawLine) {
+            try {
+              const sessions = JSON.parse(rawLine);
+              handleSessionSnapshot(sessions);
+            } catch (error) {
+              console.error("Failed to parse event payload", error);
+            }
+          }
+          newlineIndex = buffer.indexOf("\n");
+        }
+      }
+
+      if (buffer.trim()) {
+        try {
+          const sessions = JSON.parse(buffer.trim());
+          handleSessionSnapshot(sessions);
+        } catch (error) {
+          console.error("Failed to parse trailing event payload", error);
+        }
+      }
+    } catch (error) {
+      if (controller.signal.aborted || shuttingDown) {
+        return;
+      }
+      console.warn("Live event stream disconnected. Falling back to polling.", error);
+      startPolling();
+    } finally {
+      if (liveEventStreamAbort === controller) {
+        liveEventStreamAbort = null;
+      }
+    }
+  })();
+
   return true;
 }
 
@@ -249,7 +298,7 @@ function connectWebSocket() {
       return;
     }
     liveWebSocket = null;
-    if (connectEventSource()) {
+    if (connectEventStream()) {
       return;
     }
     startPolling();
@@ -269,7 +318,7 @@ function setupLiveUpdates() {
   if (connectWebSocket()) {
     return;
   }
-  if (connectEventSource()) {
+  if (connectEventStream()) {
     return;
   }
   startPolling();
@@ -284,11 +333,10 @@ function cleanupLiveUpdates() {
     socket.onclose = null;
     socket.close();
   }
-  if (liveEventSource) {
-    const source = liveEventSource;
-    liveEventSource = null;
-    source.onerror = null;
-    source.close();
+  if (liveEventStreamAbort) {
+    const controller = liveEventStreamAbort;
+    liveEventStreamAbort = null;
+    controller.abort();
   }
 }
 

@@ -101,17 +101,17 @@ def test_stop_session_persists_backend_artifacts(client: TestClient) -> None:
     assert detections, "recording backend should persist detections for the segment"
 
 
-def _read_sse_snapshot(
+def _read_event_snapshot(
     lines: Iterator[str | bytes], *, timeout: float = 5.0
 ) -> list[Session]:
-    """Return the next session snapshot emitted by the SSE stream."""
+    """Return the next session snapshot emitted by the events stream."""
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
             line = next(lines)
         except StopIteration as exc:  # pragma: no cover - defensive guard
-            raise AssertionError("SSE stream ended unexpectedly") from exc
+            raise AssertionError("Event stream ended unexpectedly") from exc
 
         if not line:
             continue
@@ -119,35 +119,32 @@ def _read_sse_snapshot(
         if isinstance(line, bytes):
             line = line.decode("utf-8")
 
-        if not line.startswith("data:"):
-            continue
-
-        payload = json.loads(line.removeprefix("data:").strip())
+        payload = json.loads(line.strip())
         assert isinstance(payload, list)
         return [Session.model_validate(item) for item in payload]
 
-    raise AssertionError("Timed out waiting for SSE payload")
+    raise AssertionError("Timed out waiting for event payload")
 
 
 def test_session_events_stream_provides_live_updates(client: TestClient) -> None:
-    """The SSE endpoint should emit snapshots for lifecycle changes."""
+    """The events endpoint should emit snapshots for lifecycle changes."""
 
     with client.stream("GET", "/sessions/events") as stream:
         assert stream.status_code == 200
-        assert stream.headers.get("content-type", "").startswith("text/event-stream")
+        assert stream.headers.get("content-type", "").startswith("application/x-ndjson")
         snapshots = stream.iter_lines()
 
-        initial = _read_sse_snapshot(snapshots, timeout=2.0)
+        initial = _read_event_snapshot(snapshots, timeout=2.0)
         assert initial == []
 
         session = validate_session_payload(client.post("/sessions").json())
-        update = _read_sse_snapshot(snapshots, timeout=3.0)
+        update = _read_event_snapshot(snapshots, timeout=3.0)
         updated_sessions = {item.id: item for item in update}
         assert session.id in updated_sessions
         assert updated_sessions[session.id].ended_at is None
 
         client.post(f"/sessions/{session.id}/stop")
-        final = _read_sse_snapshot(snapshots, timeout=3.0)
+        final = _read_event_snapshot(snapshots, timeout=3.0)
         stopped_sessions = {item.id: item for item in final}
         assert session.id in stopped_sessions
         assert stopped_sessions[session.id].ended_at is not None
@@ -171,4 +168,3 @@ def test_session_websocket_provides_live_updates(client: TestClient) -> None:
         final = websocket.receive_json()
         stopped = next(item for item in final if item["id"] == str(session.id))
         assert stopped["ended_at"] is not None
-
