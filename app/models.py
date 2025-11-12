@@ -1,4 +1,5 @@
 """Data models used by the Buurt Sense API."""
+
 from __future__ import annotations
 
 import uuid
@@ -26,6 +27,10 @@ class Session:
     id: UUID
     started_at: datetime
     ended_at: Optional[datetime] = None
+    device_info: Optional[Dict[str, Any]] = None
+    gps_origin: Optional[Dict[str, Any]] = None
+    orientation_origin: Optional[Dict[str, Any]] = None
+    config_snapshot: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable dictionary representation."""
@@ -34,6 +39,10 @@ class Session:
             "id": str(self.id),
             "started_at": self.started_at.isoformat(),
             "ended_at": self.ended_at.isoformat() if self.ended_at else None,
+            "device_info": self.device_info,
+            "gps_origin": self.gps_origin,
+            "orientation_origin": self.orientation_origin,
+            "config_snapshot": self.config_snapshot,
         }
 
     def model_copy(self, *, update: Mapping[str, Any] | None = None) -> "Session":
@@ -43,6 +52,10 @@ class Session:
             "id": self.id,
             "started_at": self.started_at,
             "ended_at": self.ended_at,
+            "device_info": self.device_info,
+            "gps_origin": self.gps_origin,
+            "orientation_origin": self.orientation_origin,
+            "config_snapshot": self.config_snapshot,
         }
         if update:
             data.update(update)
@@ -76,7 +89,13 @@ class Session:
         return cls(
             id=cls._parse_uuid(data["id"]),
             started_at=cls._parse_datetime(data["started_at"]),
-            ended_at=cls._parse_datetime(data["ended_at"]) if data.get("ended_at") else None,
+            ended_at=(
+                cls._parse_datetime(data["ended_at"]) if data.get("ended_at") else None
+            ),
+            device_info=data.get("device_info"),
+            gps_origin=data.get("gps_origin"),
+            orientation_origin=data.get("orientation_origin"),
+            config_snapshot=data.get("config_snapshot"),
         )
 
     @classmethod
@@ -98,7 +117,6 @@ if SQLMODEL_AVAILABLE:
         ts: datetime
         accuracy_m: Optional[float] = None
 
-
     class OrientationPoint(SQLModel):
         """ORM model describing an orientation data point."""
 
@@ -106,7 +124,6 @@ if SQLMODEL_AVAILABLE:
         pitch_deg: Optional[float] = None
         roll_deg: Optional[float] = None
         ts: Optional[datetime] = None
-
 
     class DetectionSummary(SQLModel):
         """ORM payload representing aggregated detection metadata."""
@@ -117,7 +134,6 @@ if SQLMODEL_AVAILABLE:
         last_ts: Optional[datetime] = None
         high_confidence: Optional[Dict[str, Any]] = None
 
-
     class ConfigSnapshot(SQLModel):
         """Persisted configuration for a capture session."""
 
@@ -125,7 +141,6 @@ if SQLMODEL_AVAILABLE:
         overlap_sec: int
         confidence_threshold: float
         class_cooldown_sec: Optional[int] = None
-
 
     class RecordingSession(SQLModel, table=True):
         """ORM definition for a recording session."""
@@ -169,7 +184,6 @@ if SQLMODEL_AVAILABLE:
 
         segments: List["Segment"] = Relationship(back_populates="session")
 
-
     class Segment(SQLModel, table=True):
         """ORM definition for captured media segments."""
 
@@ -205,7 +219,6 @@ if SQLMODEL_AVAILABLE:
         session: RecordingSession = Relationship(back_populates="segments")
         detections: List["Detection"] = Relationship(back_populates="segment")
 
-
     class Detection(SQLModel, table=True):
         """ORM definition for individual detections."""
 
@@ -233,7 +246,6 @@ if SQLMODEL_AVAILABLE:
         inference_latency_ms: Optional[int] = None
 
         segment: Segment = Relationship(back_populates="detections")
-
 
     __all__.extend(
         [

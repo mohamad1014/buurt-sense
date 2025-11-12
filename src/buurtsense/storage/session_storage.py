@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
@@ -22,6 +22,7 @@ class RecordingSessionCreate:
     device_info: dict[str, Any] | None = None
     gps_origin: dict[str, Any] | None = None
     orientation_origin: dict[str, Any] | None = None
+    config_snapshot: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -60,7 +61,9 @@ class DetectionCreate:
 class SessionStorage:
     """Facade responsible for durable session persistence."""
 
-    def __init__(self, *, engine: AsyncEngine | None = None, db_url: str | None = None) -> None:
+    def __init__(
+        self, *, engine: AsyncEngine | None = None, db_url: str | None = None
+    ) -> None:
         if engine is None:
             self.engine = create_engine(db_url)
         else:
@@ -99,13 +102,16 @@ class SessionStorage:
                 device_info=payload.device_info,
                 gps_origin=payload.gps_origin,
                 orientation_origin=payload.orientation_origin,
+                config_snapshot=payload.config_snapshot,
             )
             session.add(record)
             await session.flush()
             await session.refresh(record)
             return record
 
-    async def end_session(self, session_id: str, payload: RecordingSessionUpdate) -> RecordingSession:
+    async def end_session(
+        self, session_id: str, payload: RecordingSessionUpdate
+    ) -> RecordingSession:
         """Mark a session as ended and optionally update device metadata."""
 
         async with session_scope(self.sessionmaker) as session:
@@ -158,6 +164,15 @@ class SessionStorage:
             await session.refresh(detection)
             return detection
 
+    async def get_segment(self, segment_id: str) -> Segment:
+        """Retrieve a segment by identifier."""
+
+        async with self.sessionmaker() as session:
+            result = await session.execute(
+                select(Segment).where(Segment.id == segment_id)
+            )
+            return result.scalar_one()
+
     async def get_session(self, session_id: str) -> RecordingSession:
         """Retrieve a session and its related data."""
 
@@ -173,7 +188,9 @@ class SessionStorage:
             )
             return result.scalar_one()
 
-    async def list_sessions(self, limit: int = 20, offset: int = 0) -> list[RecordingSession]:
+    async def list_sessions(
+        self, limit: int = 20, offset: int = 0
+    ) -> list[RecordingSession]:
         """Return a paginated list of sessions."""
 
         async with self.sessionmaker() as session:
@@ -184,3 +201,31 @@ class SessionStorage:
                 .limit(limit)
             )
             return list(result.scalars().all())
+
+    async def list_session_detections(
+        self, session_id: str, *, limit: int = 50, offset: int = 0
+    ) -> tuple[list[Detection], int]:
+        """Return detections for a session with pagination support."""
+
+        async with self.sessionmaker() as session:
+            detections_stmt = (
+                select(Detection)
+                .join(Segment)
+                .where(Segment.session_id == session_id)
+                .order_by(Detection.timestamp.asc())
+                .offset(offset)
+                .limit(limit)
+            )
+            detection_records = await session.execute(detections_stmt)
+            detections = list(detection_records.scalars().all())
+
+            total_stmt = (
+                select(func.count())
+                .select_from(Detection)
+                .join(Segment)
+                .where(Segment.session_id == session_id)
+            )
+            total_result = await session.execute(total_stmt)
+            total = int(total_result.scalar_one())
+
+            return detections, total
