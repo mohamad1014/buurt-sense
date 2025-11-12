@@ -6,10 +6,11 @@ import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Callable, Dict, Mapping, Protocol
+from typing import Any, Callable, Dict, Mapping, Protocol, Type, TypeVar
 from uuid import UUID
 
 from fastapi.encoders import jsonable_encoder
+from pydantic import BaseModel
 
 from buurtsense.storage import (
     DetectionCreate as StorageDetectionCreate,
@@ -120,6 +121,9 @@ class SessionSnapshot:
 
     revision: int
     sessions: tuple[Session, ...]
+
+
+SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
 
 class SessionStore:
@@ -570,7 +574,7 @@ class SessionStore:
         }
         if payload["file_uri"] is None:
             raise ValueError("segment file path is required")
-        return SegmentRead.model_validate(payload)
+        return self._validate_schema(SegmentRead, payload)
 
     def _detection_to_schema(self, detection: Any) -> DetectionRead:
         """Convert a persisted detection into the API schema."""
@@ -601,7 +605,7 @@ class SessionStore:
         }
         if payload["segment_id"] is None or payload["class"] is None:
             raise ValueError("detection requires a segment_id and class")
-        return DetectionRead.model_validate(payload)
+        return self._validate_schema(DetectionRead, payload)
 
     async def _snapshot(self) -> list[Session]:
         """Return a sorted snapshot of all persisted sessions."""
@@ -634,3 +638,24 @@ class SessionStore:
                     # Drop the update if the subscriber is unresponsive; the next
                     # snapshot will overwrite any stale data.
                     continue
+
+    @staticmethod
+    def _validate_schema(model: Type[SchemaT], payload: dict[str, Any]) -> SchemaT:
+        """
+        Validate payload with the provided Pydantic model with v1/v2 compatibility.
+
+        Pydantic v2 exposes ``model_validate`` while v1 uses ``parse_obj``. This
+        helper keeps the store agnostic to the installed major version.
+        """
+
+        validator = getattr(model, "model_validate", None)
+        if callable(validator):
+            return validator(payload)
+
+        parser = getattr(model, "parse_obj", None)
+        if callable(parser):
+            return parser(payload)
+
+        raise AttributeError(
+            f"{model.__name__} does not expose model_validate or parse_obj"
+        )
