@@ -98,21 +98,7 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
     async def create_session(payload: SessionCreate) -> Session:
         """Start a new recording session."""
 
-        metadata: dict[str, Any] = {}
-        if payload.device_info is not None:
-            metadata["device_info"] = jsonable_encoder(
-                payload.device_info, exclude_none=True
-            )
-        metadata["gps_origin"] = jsonable_encoder(payload.gps_origin)
-        if payload.orientation_origin is not None:
-            metadata["orientation_origin"] = jsonable_encoder(
-                payload.orientation_origin, exclude_none=True
-            )
-        metadata["config_snapshot"] = jsonable_encoder(
-            payload.config_snapshot, exclude_none=True
-        )
-
-        return await store.create(metadata=metadata)
+        return await store.create(payload)
 
     @app.post("/sessions/{session_id}/segments", status_code=status.HTTP_201_CREATED)
     async def create_segment(

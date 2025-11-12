@@ -22,6 +22,18 @@ uv run uvicorn --factory app.main:create_app --reload --host 0.0.0.0 --port 8000
 
 Once the server is running, visit `http://localhost:8000/` for the recording control panel or `http://localhost:8000/docs` for the automatically generated Swagger UI.
 
+### Recording Backend Configuration
+
+The default recording backend now captures media segments continuously while sessions are active and stores them on disk. Configure its behaviour with the following environment variables:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `BUURT_CAPTURE_ROOT` | Root directory where segment files are written. | `recordings` (relative to the working directory) |
+| `BUURT_SEGMENT_LENGTH_SEC` | Target duration, in seconds, for each generated segment. | `5.0` |
+| `BUURT_SEGMENT_BYTES_PER_SEC` | Approximate bytes written per second of captured media (controls file size). | `32000` |
+
+Segments are streamed into `<BUURT_CAPTURE_ROOT>/<session-id>/segment-XXXX.pcm` and detections are emitted in real time while the session is running.
+
 ## Running Tests
 
 Install dependencies with [uv](https://docs.astral.sh/uv/) and execute the pytest suite to validate the API behaviour:
@@ -35,6 +47,20 @@ uv run --extra dev pytest
 ```
 
 `uv sync --extra dev` creates a project-local virtual environment automatically (default: `.venv`) with both runtime and development dependencies. You do not need to activate it manually; `uv run` handles environment resolution for each command.
+
+## Database Migrations
+
+The project uses [Alembic](https://alembic.sqlalchemy.org/) for schema management. Set `BUURTSENSE_DB_URL` to point at your database (defaults to the SQLite file `sqlite+aiosqlite:///./buurtsense.db`). Run migrations with either the helper script or Alembic CLI:
+
+```bash
+# Apply all pending migrations using the helper script
+uv run python scripts/init_db.py
+
+# Or run Alembic directly
+uv run alembic upgrade head
+```
+
+You can inspect the generated SQL with `uv run alembic history` and create new revisions via `uv run alembic revision -m "message"` once your models change.
 
 ### Test Coverage
 
@@ -132,7 +158,8 @@ TBD after tech stack decision.
 - **Pragmas**: WAL + foreign-key enforcement for resilience and concurrency
 - **Tables**: `recording_sessions`, `segments`, `detections`
 - **Access Layer**: `SessionStorage` facade for session lifecycle, segments, and detections
-- **Initialization**: `python scripts/init_db.py`
+- **Initialization**: `uv run python scripts/init_db.py` (applies Alembic migrations)
+- **Configuration**: `BUURTSENSE_DB_URL` points at the runtime database (default: `sqlite+aiosqlite:///./buurtsense.db`)
 
 ### Model Strategy (Revised)
 - **Primary Detection**: Lightweight local models for initial screening

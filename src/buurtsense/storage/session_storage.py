@@ -19,10 +19,19 @@ class RecordingSessionCreate:
     """Payload required to start a recording session."""
 
     started_at: datetime
+    ended_at: datetime | None = None
+    device_id: str | None = None
+    operator_alias: str | None = None
+    notes: str | None = None
+    timezone: str = "UTC"
+    app_version: str | None = None
+    model_bundle_version: str | None = None
     device_info: dict[str, Any] | None = None
     gps_origin: dict[str, Any] | None = None
     orientation_origin: dict[str, Any] | None = None
     config_snapshot: dict[str, Any] | None = None
+    detection_summary: dict[str, Any] | None = None
+    redact_location: bool = False
 
 
 @dataclass(slots=True)
@@ -77,7 +86,7 @@ class SessionStorage:
         return self._sessionmaker
 
     async def initialize(self) -> None:
-        """Create database tables on first launch."""
+        """Apply database migrations on first launch."""
 
         await init_db(self.engine)
 
@@ -99,10 +108,19 @@ class SessionStorage:
         async with session_scope(self.sessionmaker) as session:
             record = RecordingSession(
                 started_at=payload.started_at,
+                ended_at=payload.ended_at,
+                device_id=payload.device_id,
+                operator_alias=payload.operator_alias,
+                notes=payload.notes,
+                timezone=payload.timezone,
+                app_version=payload.app_version,
+                model_bundle_version=payload.model_bundle_version,
                 device_info=payload.device_info,
                 gps_origin=payload.gps_origin,
                 orientation_origin=payload.orientation_origin,
                 config_snapshot=payload.config_snapshot,
+                detection_summary=payload.detection_summary or {},
+                redact_location=payload.redact_location,
             )
             session.add(record)
             await session.flush()
@@ -161,8 +179,84 @@ class SessionStorage:
             )
             session.add(detection)
             await session.flush()
+            await self._update_detection_summary(
+                session, detection.segment_id, detection
+            )
             await session.refresh(detection)
             return detection
+
+    @staticmethod
+    def _parse_summary_timestamp(value: Any) -> datetime | None:
+        """Return a datetime parsed from stored summary metadata."""
+
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value)
+            except ValueError:
+                return None
+        return None
+
+    async def _update_detection_summary(
+        self, session: AsyncSession, segment_id: str, detection: Detection
+    ) -> None:
+        """Update a session's detection summary after persisting a detection."""
+
+        segment = await session.get(Segment, segment_id)
+        if segment is None:
+            return
+
+        record = await session.get(RecordingSession, segment.session_id)
+        if record is None:
+            return
+
+        summary: dict[str, Any] = dict(record.detection_summary or {})
+
+        total = summary.get("total_detections", 0)
+        try:
+            total_int = int(total)
+        except (TypeError, ValueError):
+            total_int = 0
+        summary["total_detections"] = total_int + 1
+
+        by_class_raw = summary.get("by_class") or {}
+        by_class: dict[str, int] = {}
+        if isinstance(by_class_raw, dict):
+            for label, count in by_class_raw.items():
+                try:
+                    by_class[str(label)] = int(count)
+                except (TypeError, ValueError):
+                    continue
+        by_class[detection.label] = by_class.get(detection.label, 0) + 1
+        summary["by_class"] = by_class
+
+        ts = detection.timestamp
+        first_ts = self._parse_summary_timestamp(summary.get("first_ts"))
+        if first_ts is None or ts < first_ts:
+            summary["first_ts"] = ts.isoformat()
+        last_ts = self._parse_summary_timestamp(summary.get("last_ts"))
+        if last_ts is None or ts > last_ts:
+            summary["last_ts"] = ts.isoformat()
+
+        high_confidence_raw = summary.get("high_confidence")
+        existing_confidence: float | None = None
+        if isinstance(high_confidence_raw, dict):
+            try:
+                existing_confidence = float(high_confidence_raw.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                existing_confidence = None
+
+        if existing_confidence is None or detection.confidence > existing_confidence:
+            summary["high_confidence"] = {
+                "class": detection.label,
+                "confidence": detection.confidence,
+                "ts": ts.isoformat(),
+            }
+
+        record.detection_summary = summary
+        session.add(record)
+        await session.flush([record])
 
     async def get_segment(self, segment_id: str) -> Segment:
         """Retrieve a segment by identifier."""
