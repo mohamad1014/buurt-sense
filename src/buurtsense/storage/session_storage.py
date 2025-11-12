@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
@@ -201,3 +201,31 @@ class SessionStorage:
                 .limit(limit)
             )
             return list(result.scalars().all())
+
+    async def list_session_detections(
+        self, session_id: str, *, limit: int = 50, offset: int = 0
+    ) -> tuple[list[Detection], int]:
+        """Return detections for a session with pagination support."""
+
+        async with self.sessionmaker() as session:
+            detections_stmt = (
+                select(Detection)
+                .join(Segment)
+                .where(Segment.session_id == session_id)
+                .order_by(Detection.timestamp.asc())
+                .offset(offset)
+                .limit(limit)
+            )
+            detection_records = await session.execute(detections_stmt)
+            detections = list(detection_records.scalars().all())
+
+            total_stmt = (
+                select(func.count())
+                .select_from(Detection)
+                .join(Segment)
+                .where(Segment.session_id == session_id)
+            )
+            total_result = await session.execute(total_stmt)
+            total = int(total_result.scalar_one())
+
+            return detections, total

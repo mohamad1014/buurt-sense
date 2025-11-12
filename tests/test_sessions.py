@@ -284,7 +284,9 @@ def test_segment_and_detection_uploads_persist_and_broadcast(
 
     record = asyncio.run(_fetch())
     assert record.segments
-    stored_segment = next(seg for seg in record.segments if seg.id == segment_data["id"])
+    stored_segment = next(
+        seg for seg in record.segments if seg.id == segment_data["id"]
+    )
     assert stored_segment.file_path == segment_payload["file_uri"]
     assert stored_segment.index == segment_payload["index"]
     assert stored_segment.gps_trace
@@ -298,6 +300,109 @@ def test_segment_and_detection_uploads_persist_and_broadcast(
     stored_detection = stored_segment.detections[0]
     assert stored_detection.label == detection_payload["class"]
     assert stored_detection.confidence == detection_payload["confidence"]
+
+
+def _assert_timezone(value: str) -> datetime:
+    dt = datetime.fromisoformat(value)
+    assert dt.tzinfo is not None, "datetime values must include timezone information"
+    return dt
+
+
+def test_session_detail_endpoint_returns_expected_payload(
+    client: TestClient,
+) -> None:
+    session, metadata = start_session(client)
+
+    segment_payload = make_segment_payload()
+    segment_response = client.post(
+        f"/sessions/{session.id}/segments", json=segment_payload
+    )
+    assert segment_response.status_code == 201
+    segment_data = segment_response.json()
+
+    detection_payload = make_detection_payload()
+    detection_response = client.post(
+        f"/segments/{segment_data['id']}/detections", json=detection_payload
+    )
+    assert detection_response.status_code == 201
+
+    detail_response = client.get(f"/sessions/{session.id}/detail")
+    assert detail_response.status_code == 200
+    detail = detail_response.json()
+
+    assert detail["id"] == str(session.id)
+    assert detail["device_info"] == metadata.get("device_info")
+    assert detail["gps_origin"]["lat"] == metadata["gps_origin"]["lat"]
+    _assert_timezone(detail["started_at"])
+    assert detail["detections"], "session detail should include detections"
+
+    segment_detail = detail["segments"][0]
+    assert segment_detail["file_uri"] == segment_payload["file_uri"]
+    _assert_timezone(segment_detail["start_ts"])
+    _assert_timezone(segment_detail["end_ts"])
+
+    detection_detail = detail["detections"][0]
+    assert detection_detail["class"] == detection_payload["class"]
+    _assert_timezone(detection_detail["timestamp"])
+
+
+def test_session_detection_pagination_returns_expected_pages(
+    client: TestClient,
+) -> None:
+    session, _ = start_session(client)
+
+    segment_payload = make_segment_payload()
+    segment_response = client.post(
+        f"/sessions/{session.id}/segments", json=segment_payload
+    )
+    assert segment_response.status_code == 201
+    segment_id = segment_response.json()["id"]
+
+    first_detection = make_detection_payload()
+    first_response = client.post(
+        f"/segments/{segment_id}/detections", json=first_detection
+    )
+    assert first_response.status_code == 201
+
+    second_detection = make_detection_payload()
+    base_ts = datetime.fromisoformat(first_detection["timestamp"])
+    adjusted_ts = (base_ts + timedelta(seconds=5)).isoformat()
+    second_detection["class"] = "siren"
+    second_detection["timestamp"] = adjusted_ts
+    second_detection["gps_point"]["ts"] = adjusted_ts
+    second_response = client.post(
+        f"/segments/{segment_id}/detections", json=second_detection
+    )
+    assert second_response.status_code == 201
+
+    first_page = client.get(
+        f"/sessions/{session.id}/detections",
+        params={"limit": 1, "offset": 0},
+    )
+    assert first_page.status_code == 200
+    first_payload = first_page.json()
+    assert first_payload["total"] == 2
+    assert first_payload["limit"] == 1
+    assert first_payload["offset"] == 0
+    assert len(first_payload["items"]) == 1
+    first_item = first_payload["items"][0]
+    assert first_item["class"] == first_detection["class"]
+    assert first_item["segment_id"] == segment_id
+    _assert_timezone(first_item["timestamp"])
+
+    second_page = client.get(
+        f"/sessions/{session.id}/detections",
+        params={"limit": 1, "offset": 1},
+    )
+    assert second_page.status_code == 200
+    second_payload = second_page.json()
+    assert second_payload["total"] == 2
+    assert second_payload["offset"] == 1
+    assert len(second_payload["items"]) == 1
+    second_item = second_payload["items"][0]
+    assert second_item["class"] == second_detection["class"]
+    assert second_item["segment_id"] == segment_id
+    _assert_timezone(second_item["timestamp"])
 
 
 def test_session_websocket_provides_live_updates(client: TestClient) -> None:

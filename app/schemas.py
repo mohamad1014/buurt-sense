@@ -99,11 +99,12 @@ class SessionCreate(SessionBase):
 
 class SessionRead(SessionBase):
     id: uuid.UUID
-    device_id: uuid.UUID
-    timezone: str
-    detection_summary: DetectionSummary
-    created_at: datetime
-    updated_at: datetime
+    device_id: Optional[uuid.UUID] = None
+    device_info: Optional[Dict[str, Any]] = None
+    timezone: Optional[str] = None
+    detection_summary: Optional[DetectionSummary] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         orm_mode = True
@@ -191,9 +192,20 @@ class PaginatedDetections(BaseModel):
     offset: int
 
 
-class SessionDetail(SessionRead):
+class SessionDetail(BaseModel):
+    id: uuid.UUID
+    started_at: datetime
+    ended_at: Optional[datetime] = None
+    device_info: Optional[Dict[str, Any]] = None
+    gps_origin: GPSOrigin
+    orientation_origin: Optional[OrientationOrigin] = None
+    config_snapshot: ConfigSnapshot
+    detection_summary: Optional[DetectionSummary] = None
     segments: List[SegmentRead] = Field(default_factory=list)
-    detections: Optional[List[DetectionRead]] = None
+    detections: List[DetectionRead] = Field(default_factory=list)
+
+    class Config:
+        orm_mode = True
 
 
 class SessionListResponse(BaseModel):

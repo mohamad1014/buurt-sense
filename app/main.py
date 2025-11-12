@@ -21,7 +21,13 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from .models import Session
-from .schemas import DetectionCreate, SegmentCreate, SessionCreate
+from .schemas import (
+    DetectionCreate,
+    PaginatedDetections,
+    SegmentCreate,
+    SessionCreate,
+    SessionDetail,
+)
 from .storage import (
     SessionAlreadyStoppedError,
     SessionNotFoundError,
@@ -104,9 +110,7 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
 
         return await store.create(metadata=metadata)
 
-    @app.post(
-        "/sessions/{session_id}/segments", status_code=status.HTTP_201_CREATED
-    )
+    @app.post("/sessions/{session_id}/segments", status_code=status.HTTP_201_CREATED)
     async def create_segment(
         session_id: UUID, payload: SegmentCreate
     ) -> dict[str, Any]:
@@ -127,9 +131,7 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
 
         return jsonable_encoder(segment)
 
-    @app.post(
-        "/segments/{segment_id}/detections", status_code=status.HTTP_201_CREATED
-    )
+    @app.post("/segments/{segment_id}/detections", status_code=status.HTTP_201_CREATED)
     async def create_detection(
         segment_id: UUID, payload: DetectionCreate
     ) -> dict[str, Any]:
@@ -193,6 +195,40 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Session not found",
             ) from exc
+
+    @app.get("/sessions/{session_id}/detail")
+    async def get_session_detail(session_id: UUID) -> SessionDetail:
+        """Retrieve a detailed view of a session with segments and detections."""
+
+        try:
+            detail = await store.get_detail(session_id)
+        except SessionNotFoundError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Session not found",
+            ) from exc
+
+        return detail
+
+    @app.get("/sessions/{session_id}/detections")
+    async def list_session_detections(
+        session_id: UUID,
+        limit: int = Query(default=50, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+    ) -> PaginatedDetections:
+        """Return a paginated list of detections for a session."""
+
+        try:
+            payload = await store.list_detections(
+                session_id, limit=limit, offset=offset
+            )
+        except SessionNotFoundError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Session not found",
+            ) from exc
+
+        return payload
 
     @app.post("/sessions/{session_id}/stop")
     async def stop_session(session_id: UUID) -> Session:

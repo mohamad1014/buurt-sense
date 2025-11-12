@@ -22,7 +22,11 @@ from sqlalchemy.exc import NoResultFound
 
 from .models import Session
 from .schemas import DetectionCreate as DetectionCreateSchema
+from .schemas import DetectionRead
+from .schemas import PaginatedDetections
 from .schemas import SegmentCreate as SegmentCreateSchema
+from .schemas import SegmentRead
+from .schemas import SessionDetail
 
 
 class SessionNotFoundError(KeyError):
@@ -266,9 +270,7 @@ class SessionStore:
             ),
             "file_path": segment.file_path,
             "gps_trace": list(getattr(segment, "gps_trace", [])),
-            "orientation_trace": list(
-                getattr(segment, "orientation_trace", [])
-            ),
+            "orientation_trace": list(getattr(segment, "orientation_trace", [])),
         }
 
     async def create_detection(
@@ -322,6 +324,82 @@ class SessionStore:
 
         record = await self._get_record(session_id)
         return self._to_session(record)
+
+    async def get_detail(self, session_id: UUID) -> SessionDetail:
+        """Return a detailed view of a session including segments and detections."""
+
+        record = await self._get_record(session_id)
+        started_at = self._normalize_datetime(
+            getattr(record, "started_at", None),
+            field="started_at",
+            required=True,
+        )
+        if started_at is None:  # pragma: no cover - defensive guard
+            raise ValueError("started_at cannot be None")
+
+        ended_at = self._normalize_datetime(
+            getattr(record, "ended_at", None),
+            field="ended_at",
+            required=False,
+        )
+
+        gps_origin = self._coerce_optional_mapping(
+            getattr(record, "gps_origin", None), field="gps_origin"
+        )
+        if gps_origin is None:
+            raise ValueError("gps_origin metadata is required")
+
+        config_snapshot = self._coerce_optional_mapping(
+            getattr(record, "config_snapshot", None),
+            required=True,
+            field="config_snapshot",
+        )
+
+        orientation_origin = self._coerce_optional_mapping(
+            getattr(record, "orientation_origin", None),
+            field="orientation_origin",
+        )
+
+        segments = [
+            self._segment_to_schema(segment)
+            for segment in getattr(record, "segments", [])
+        ]
+
+        detections = [
+            self._detection_to_schema(detection)
+            for segment in getattr(record, "segments", [])
+            for detection in getattr(segment, "detections", [])
+        ]
+
+        return SessionDetail(
+            id=UUID(str(record.id)),
+            started_at=started_at,
+            ended_at=ended_at,
+            device_info=self._coerce_optional_mapping(
+                getattr(record, "device_info", None), field="device_info"
+            ),
+            gps_origin=gps_origin,
+            orientation_origin=orientation_origin,
+            config_snapshot=config_snapshot,
+            detection_summary=self._coerce_optional_mapping(
+                getattr(record, "detection_summary", None),
+                field="detection_summary",
+            ),
+            segments=segments,
+            detections=detections,
+        )
+
+    async def list_detections(
+        self, session_id: UUID, *, limit: int = 50, offset: int = 0
+    ) -> PaginatedDetections:
+        """Return a paginated list of detections for a session."""
+
+        await self._get_record(session_id)
+        detections, total = await self._storage.list_session_detections(
+            str(session_id), limit=limit, offset=offset
+        )
+        items = [self._detection_to_schema(detection) for detection in detections]
+        return PaginatedDetections(items=items, total=total, limit=limit, offset=offset)
 
     async def list(self) -> list[Session]:
         """List all sessions ordered by most recent start time."""
@@ -460,6 +538,70 @@ class SessionStore:
             ),
         )
         return adapter.to_session()
+
+    def _segment_to_schema(self, segment: Any) -> SegmentRead:
+        """Convert a persisted segment into the API schema."""
+
+        start_ts = self._normalize_datetime(
+            getattr(segment, "start_ts", None),
+            field="start_ts",
+            required=True,
+        )
+        end_ts = self._normalize_datetime(
+            getattr(segment, "end_ts", None),
+            field="end_ts",
+            required=True,
+        )
+        if start_ts is None or end_ts is None:
+            raise ValueError("segment timestamps cannot be None")
+
+        payload: dict[str, Any] = {
+            "id": segment.id,
+            "index": getattr(segment, "index", 0),
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "file_uri": getattr(segment, "file_path", None),
+            "frame_count": getattr(segment, "frame_count", None),
+            "audio_duration_ms": getattr(segment, "audio_duration_ms", None),
+            "gps_trace": list(getattr(segment, "gps_trace", []) or []),
+            "orientation_trace": list(getattr(segment, "orientation_trace", []) or []),
+            "checksum": getattr(segment, "checksum", None),
+            "size_bytes": getattr(segment, "size_bytes", None),
+        }
+        if payload["file_uri"] is None:
+            raise ValueError("segment file path is required")
+        return SegmentRead.model_validate(payload)
+
+    def _detection_to_schema(self, detection: Any) -> DetectionRead:
+        """Convert a persisted detection into the API schema."""
+
+        timestamp = self._normalize_datetime(
+            getattr(detection, "timestamp", None),
+            field="timestamp",
+            required=True,
+        )
+        if timestamp is None:
+            raise ValueError("detection timestamp cannot be None")
+
+        orientation = getattr(detection, "orientation", None)
+        heading = None
+        if isinstance(orientation, Mapping):
+            heading = orientation.get("heading_deg")
+
+        payload: dict[str, Any] = {
+            "id": detection.id,
+            "segment_id": getattr(detection, "segment_id", None),
+            "class": getattr(detection, "label", None),
+            "confidence": getattr(detection, "confidence", 0.0),
+            "timestamp": timestamp,
+            "gps_point": getattr(detection, "gps_point", None),
+            "orientation_heading_deg": heading,
+            "model_id": getattr(detection, "model_id", None),
+            "inference_latency_ms": getattr(detection, "inference_latency_ms", None),
+        }
+        if payload["segment_id"] is None or payload["class"] is None:
+            raise ValueError("detection requires a segment_id and class")
+        return DetectionRead.model_validate(payload)
 
     async def _snapshot(self) -> list[Session]:
         """Return a sorted snapshot of all persisted sessions."""
