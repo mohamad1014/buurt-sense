@@ -112,7 +112,7 @@ Excluded (Future Phases):
 | Category | Feature | Status | Notes |
 |----------|---------|--------|-------|
 | Capture | Start/stop session | Implemented | FastAPI endpoints plus the browser control panel handle create/stop flows (`app/main.py`, `app/frontend/static/app.js`). |
-| Capture | Continuous AV segmentation | Backend stub only | `ContinuousCaptureBackend` writes synthetic PCM files, but the browser never captures MediaStream input yet. |
+| Capture | Continuous AV segmentation | Partial (browser audio) | The control panel now streams live microphone audio via `MediaRecorder` and uploads segments to `/sessions/{id}/segments/upload`; the backend synthesiser remains as a fallback when capture is unavailable. |
 | Sensors | GPS + orientation capture | Not implemented | UI payload sends hard-coded Amsterdam coordinates and heading values. |
 | Inference | Local audio event classification | Stubbed | Backend fabricates a single `ambient_noise` detection per segment without model execution. |
 | Inference | Local video action recognition (lightweight) | Not implemented | No video processing or model loading logic exists. |
@@ -404,6 +404,7 @@ uv run uvicorn --factory app.main:create_app --reload
 | `GET /sessions` | List sessions with rounded origin coordinates, config snapshot, and detection summary counts. Includes a `status` flag (`active` / `completed`). |
 | `GET /sessions/{id}` | Retrieve full session metadata including segments. Use `expand=traces` to include GPS & orientation traces and `include=full_detections` to inline detections. |
 | `POST /sessions/{id}/segments` | Attach a media segment to a session along with traces, checksum, and sizing info. |
+| `POST /sessions/{id}/segments/upload` | Upload an audio/video blob directly from the browser; the backend stores it under the capture root and persists the derived metadata. |
 | `GET /sessions/{id}/detections` | Paginate detections associated with a session. |
 | `POST /segments/{id}/detections` | Add a detection and automatically refresh the session’s aggregated detection summary (totals, per-class counts, first/last timestamps, highest-confidence detection). |
 

@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import aclosing, asynccontextmanager
+from datetime import datetime
+from hashlib import blake2s
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 from fastapi import (
+    File,
     FastAPI,
     HTTPException,
+    Form,
     Query,
+    UploadFile,
     WebSocket,
     WebSocketDisconnect,
     status,
@@ -34,6 +39,7 @@ from .storage import (
     SessionSnapshot,
     SessionStore,
     SegmentNotFoundError,
+    resolve_capture_root,
 )
 
 FRONTEND_DIR = Path(__file__).parent / "frontend"
@@ -114,6 +120,65 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
                 detail="Session not found",
             ) from exc
         except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+        return jsonable_encoder(segment)
+
+    @app.post(
+        "/sessions/{session_id}/segments/upload",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def upload_segment(
+        session_id: UUID,
+        index: int = Form(..., ge=0),
+        start_ts: datetime = Form(...),
+        end_ts: datetime = Form(...),
+        file: UploadFile = File(...),
+    ) -> dict[str, Any]:
+        """Store an uploaded media segment on disk and persist its metadata."""
+
+        data = await file.read()
+        if not data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Uploaded file is empty",
+            )
+
+        capture_root = resolve_capture_root()
+        session_dir = capture_root / str(session_id)
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+        suffix = Path(file.filename or "segment").suffix or ".webm"
+        filename = f"segment-{index:04d}-{int(start_ts.timestamp())}{suffix}"
+        destination = session_dir / filename
+
+        await asyncio.to_thread(destination.write_bytes, data)
+
+        relative_uri = str(destination.relative_to(capture_root))
+        checksum = blake2s(data).hexdigest()
+        duration_ms = max(int((end_ts - start_ts).total_seconds() * 1000), 1)
+        payload = SegmentCreate(
+            index=index,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            file_uri=relative_uri,
+            audio_duration_ms=duration_ms,
+            size_bytes=len(data),
+            checksum=checksum,
+        )
+        try:
+            segment = await store.create_segment(session_id, payload)
+        except SessionNotFoundError as exc:
+            destination.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Session not found",
+            ) from exc
+        except ValueError as exc:
+            destination.unlink(missing_ok=True)
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=str(exc),

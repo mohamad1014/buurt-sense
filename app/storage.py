@@ -89,6 +89,19 @@ class _CaptureWorker:
         self.stop_event.set()
 
 
+def resolve_capture_root(explicit: Path | None = None) -> Path:
+    """Return the absolute capture root honoring environment overrides."""
+
+    env_root = os.environ.get("BUURT_CAPTURE_ROOT")
+    if explicit is not None:
+        root_path = explicit
+    elif env_root:
+        root_path = Path(env_root).expanduser()
+    else:
+        root_path = Path("recordings")
+    return root_path if root_path.is_absolute() else root_path.resolve()
+
+
 class ContinuousCaptureBackend:
     """Backend that records media segments and runs lightweight inference."""
 
@@ -101,13 +114,7 @@ class ContinuousCaptureBackend:
         bytes_per_second: int | None = None,
     ) -> None:
         self._store = store
-        env_root = os.environ.get("BUURT_CAPTURE_ROOT")
-        root_path = capture_root or (
-            Path(env_root).expanduser() if env_root else Path("recordings")
-        )
-        self._capture_root = (
-            root_path if root_path.is_absolute() else root_path.resolve()
-        )
+        self._capture_root = resolve_capture_root(capture_root)
         self._capture_root.mkdir(parents=True, exist_ok=True)
 
         env_length = os.environ.get("BUURT_SEGMENT_LENGTH_SEC")

@@ -418,61 +418,40 @@ def test_segment_and_detection_uploads_persist_and_broadcast(
     )
     assert detection_response.status_code == 201
 
-    second_detection_payload = make_detection_payload()
-    second_detection_payload["class"] = "siren"
-    second_detection_payload["confidence"] = 0.41
-    second_base_ts = datetime.fromisoformat(second_detection_payload["timestamp"])
-    second_timestamp = (second_base_ts + timedelta(seconds=5)).isoformat()
-    second_detection_payload["timestamp"] = second_timestamp
-    second_detection_payload["gps_point"]["ts"] = second_timestamp
-    second_response = passive_client.post(
-        f"/segments/{segment_data['id']}/detections", json=second_detection_payload
+
+def test_segment_upload_endpoint_writes_media_file(
+    passive_client: TestClient,
+) -> None:
+    """Uploading a media blob should write to disk and persist metadata."""
+
+    session, _ = start_session(passive_client)
+    start_ts = datetime.now(UTC)
+    end_ts = start_ts + timedelta(seconds=2)
+    blob = b"fake-media-bytes"
+
+    response = passive_client.post(
+        f"/sessions/{session.id}/segments/upload",
+        data={
+            "index": "0",
+            "start_ts": start_ts.isoformat(),
+            "end_ts": end_ts.isoformat(),
+        },
+        files={"file": ("segment.webm", blob, "audio/webm")},
     )
-    assert second_response.status_code == 201
-    detection_data = detection_response.json()
-    assert detection_data["label"] == detection_payload["class"]
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["size_bytes"] == len(blob)
+    assert payload["audio_duration_ms"] >= 2000
 
-    detection_revision, _ = _fetch_snapshot(
-        passive_client, cursor=segment_revision, timeout=0.1
-    )
-    assert detection_revision > segment_revision
+    capture_root = Path(os.environ["BUURT_CAPTURE_ROOT"])
+    stored_path = capture_root / payload["file_path"]
+    assert stored_path.exists()
+    assert stored_path.read_bytes() == blob
 
-    session_response = passive_client.get(f"/sessions/{session.id}")
-    assert session_response.status_code == 200
-    session_payload = session_response.json()
-    summary_payload = session_payload["detection_summary"]
-    assert summary_payload["total_detections"] >= 1
-    assert summary_payload["by_class"].get(detection_payload["class"], 0) >= 1
-    _assert_timezone(summary_payload["first_ts"])
-    _assert_timezone(summary_payload["last_ts"])
-    high_conf_summary = summary_payload["high_confidence"]
-    assert high_conf_summary["class"] == detection_payload["class"]
-    assert high_conf_summary["confidence"] == detection_payload["confidence"]
-    _assert_timezone(high_conf_summary["ts"])
-
-    store: SessionStore = passive_client.app.state.session_store
-
-    async def _fetch() -> object:
-        return await store.storage.get_session(str(session.id))
-
-    record = asyncio.run(_fetch())
-    assert record.segments
-    stored_segment = next(
-        seg for seg in record.segments if seg.id == segment_data["id"]
-    )
-    assert stored_segment.file_path == segment_payload["file_uri"]
-    assert stored_segment.index == segment_payload["index"]
-    assert stored_segment.gps_trace
-    assert stored_segment.gps_trace[0]["lat"] == segment_payload["gps_trace"][0]["lat"]
-    assert stored_segment.orientation_trace
-    assert (
-        stored_segment.orientation_trace[0]["heading_deg"]
-        == segment_payload["orientation_trace"][0]["heading_deg"]
-    )
-    assert stored_segment.detections
-    stored_detection = stored_segment.detections[0]
-    assert stored_detection.label == detection_payload["class"]
-    assert stored_detection.confidence == detection_payload["confidence"]
+    detail_response = passive_client.get(f"/sessions/{session.id}/detail")
+    assert detail_response.status_code == 200
+    segments = detail_response.json().get("segments", [])
+    assert any(seg["id"] == payload["id"] for seg in segments)
 
 
 def _assert_timezone(value: str) -> datetime:

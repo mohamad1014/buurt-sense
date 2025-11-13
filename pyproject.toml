@@ -10,6 +10,7 @@ dependencies = [
   "sqlalchemy==2.0.28",
   "pydantic==1.10.15",
   "fastapi==0.121.0",
+  "python-multipart>=0.0.9",
   "timezonefinder==6.2.0",
   "uvicorn[standard]>=0.30.0,<1.0.0",
   "aiosqlite>=0.19",
