@@ -342,13 +342,7 @@ async function startMediaCapture(session) {
       height: { ideal: 720 },
     },
   });
-  const options = {};
-  if (
-    typeof MediaRecorder !== "undefined" &&
-    MediaRecorder.isTypeSupported?.("audio/webm;codecs=opus")
-  ) {
-    options.mimeType = "audio/webm;codecs=opus";
-  }
+  const options = resolveRecorderOptions(stream);
   const recorder = new MediaRecorder(stream, options);
   const context = {
     sessionId: session.id,
@@ -398,8 +392,35 @@ async function startMediaCapture(session) {
     setStatus(`Recorder error: ${message}`, "error");
   });
 
-  recorder.start(segmentLengthMs);
+  try {
+    recorder.start(segmentLengthMs);
+  } catch (error) {
+    stream.getTracks().forEach((track) => track.stop());
+    throw error;
+  }
   captureState.context = context;
+}
+
+function resolveRecorderOptions(stream) {
+  if (typeof MediaRecorder === "undefined") {
+    return {};
+  }
+
+  const hasVideo = stream.getVideoTracks().length > 0;
+  const candidates = hasVideo
+    ? [
+        "video/webm;codecs=vp9,opus",
+        "video/webm;codecs=vp8,opus",
+        "video/webm",
+        "video/mp4",
+      ]
+    : ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
+
+  const supported = candidates.find((type) =>
+    MediaRecorder.isTypeSupported?.(type),
+  );
+
+  return supported ? { mimeType: supported } : {};
 }
 
 async function stopMediaCapture() {
