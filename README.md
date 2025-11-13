@@ -113,7 +113,7 @@ Excluded (Future Phases):
 |----------|---------|--------|-------|
 | Capture | Start/stop session | Implemented | FastAPI endpoints plus the browser control panel handle create/stop flows (`app/main.py`, `app/frontend/static/app.js`). |
 | Capture | Continuous AV segmentation | Partial (browser audio) | The control panel now streams live microphone audio via `MediaRecorder` and uploads segments to `/sessions/{id}/segments/upload`; the backend synthesiser remains as a fallback when capture is unavailable. |
-| Sensors | GPS + orientation capture | Not implemented | UI payload sends hard-coded Amsterdam coordinates and heading values. |
+| Sensors | GPS + orientation capture | Partial (browser APIs) | Control panel now requests geolocation + device orientation on session start and falls back to Amsterdam defaults when permissions are denied. |
 | Inference | Local audio event classification | Stubbed | Backend fabricates a single `ambient_noise` detection per segment without model execution. |
 | Inference | Local video action recognition (lightweight) | Not implemented | No video processing or model loading logic exists. |
 | Detection | Fight / Robbery / Fireworks / Gunshot / Scream / Glass Break / Vehicle Crash | Not implemented | Only the placeholder `ambient_noise` class is produced; planned incident classes are absent in API/UI. |

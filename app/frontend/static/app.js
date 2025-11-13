@@ -14,6 +14,7 @@ let shuttingDown = false;
 const captureState = {
   context: null,
   uploads: [],
+  orientationPermissionRequested: false,
 };
 
 function formatTimestamp(timestamp) {
@@ -150,10 +151,11 @@ async function startSession() {
   try {
     setStatus("Starting session…");
     startButton.disabled = true;
+    const sessionPayload = await buildSessionPayload();
     const session = await fetchJson("/sessions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(buildSessionPayload()),
+      body: JSON.stringify(sessionPayload),
     });
     activeSession = session;
     renderActiveSession(session);
@@ -181,24 +183,26 @@ async function startSession() {
   }
 }
 
-function buildSessionPayload() {
-  const now = new Date().toISOString();
+async function buildSessionPayload() {
+  const now = new Date();
+  const defaults = {
+    lat: 52.3676,
+    lon: 4.9041,
+    accuracy_m: 5,
+    orientation_heading_deg: 0,
+  };
+
+  const gpsOrigin = await resolveGpsOrigin(now, defaults);
+  const orientationOrigin = await resolveOrientationOrigin(now, defaults);
+
   return {
-    started_at: now,
+    started_at: now.toISOString(),
     operator_alias: "Browser Operator",
     notes: "Started from local UI",
     app_version: "web-ui",
     model_bundle_version: "demo",
-    gps_origin: {
-      lat: 52.3676,
-      lon: 4.9041,
-      accuracy_m: 5,
-      captured_at: now,
-    },
-    orientation_origin: {
-      heading_deg: 0,
-      captured_at: now,
-    },
+    gps_origin: gpsOrigin,
+    orientation_origin: orientationOrigin,
     config_snapshot: {
       segment_length_sec: 30,
       overlap_sec: 5,
@@ -209,6 +213,106 @@ function buildSessionPayload() {
       by_class: {},
     },
     redact_location: false,
+  };
+}
+
+function supportsGeolocation() {
+  return Boolean(navigator?.geolocation);
+}
+
+async function resolveGpsOrigin(now, defaults) {
+  if (!supportsGeolocation()) {
+    return {
+      lat: defaults.lat,
+      lon: defaults.lon,
+      accuracy_m: defaults.accuracy_m,
+      captured_at: now.toISOString(),
+    };
+  }
+
+  try {
+    const position = await new Promise((resolve, reject) => {
+      navigator.geolocation.getCurrentPosition(resolve, reject, {
+        enableHighAccuracy: true,
+        timeout: 8000,
+        maximumAge: 10000,
+      });
+    });
+
+    return {
+      lat: position.coords.latitude,
+      lon: position.coords.longitude,
+      accuracy_m: position.coords.accuracy,
+      captured_at: new Date(position.timestamp || Date.now()).toISOString(),
+    };
+  } catch (error) {
+    console.warn("Geolocation unavailable", error);
+    return {
+      lat: defaults.lat,
+      lon: defaults.lon,
+      accuracy_m: defaults.accuracy_m,
+      captured_at: now.toISOString(),
+    };
+  }
+}
+
+async function resolveOrientationOrigin(now, defaults) {
+  if (typeof window === "undefined" || !("DeviceOrientationEvent" in window)) {
+    return {
+      heading_deg: defaults.orientation_heading_deg,
+      captured_at: now.toISOString(),
+    };
+  }
+
+  if (
+    typeof DeviceOrientationEvent.requestPermission === "function" &&
+    !captureState.orientationPermissionRequested
+  ) {
+    captureState.orientationPermissionRequested = true;
+    try {
+      const permission = await DeviceOrientationEvent.requestPermission();
+      if (permission !== "granted") {
+        return {
+          heading_deg: defaults.orientation_heading_deg,
+          captured_at: now.toISOString(),
+        };
+      }
+    } catch (error) {
+      console.warn("Orientation permission denied", error);
+      return {
+        heading_deg: defaults.orientation_heading_deg,
+        captured_at: now.toISOString(),
+      };
+    }
+  }
+
+  const reading = await new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      window.removeEventListener("deviceorientation", handler);
+      resolve(null);
+    }, 2000);
+
+    function handler(event) {
+      clearTimeout(timeout);
+      window.removeEventListener("deviceorientation", handler);
+      resolve(event);
+    }
+
+    window.addEventListener("deviceorientation", handler, { once: true });
+  });
+
+  if (!reading) {
+    return {
+      heading_deg: defaults.orientation_heading_deg,
+      captured_at: now.toISOString(),
+    };
+  }
+
+  return {
+    heading_deg: reading.alpha ?? defaults.orientation_heading_deg,
+    pitch_deg: reading.beta ?? null,
+    roll_deg: reading.gamma ?? null,
+    captured_at: new Date().toISOString(),
   };
 }
 
@@ -230,7 +334,14 @@ async function startMediaCapture(session) {
   const segmentLengthSec =
     session?.config_snapshot?.segment_length_sec ?? 30;
   const segmentLengthMs = Math.max(segmentLengthSec * 1000, 1000);
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: true,
+    video: {
+      facingMode: "environment",
+      width: { ideal: 1280 },
+      height: { ideal: 720 },
+    },
+  });
   const options = {};
   if (
     typeof MediaRecorder !== "undefined" &&
