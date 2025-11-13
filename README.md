@@ -109,19 +109,19 @@ Excluded (Future Phases):
 - Local authority liaison (future: dashboard consumption).
 
 ## 5. Key Features (MVP)
-| Category | Feature | Status |
-|----------|---------|--------|
-| Capture | Start/stop session | Planned |
-| Capture | Continuous AV segmentation | Planned |
-| Sensors | GPS + orientation capture | Planned |
-| Inference | Local audio event classification | Planned |
-| Inference | Local video action recognition (lightweight) | Planned |
-| Detection | Fight / Robbery / Fireworks / Gunshot / Scream / Glass Break / Vehicle Crash | Planned |
-| UX | Real-time detection overlay + confidence | Planned |
-| Storage | Local file + metadata store (IndexedDB / File System Access API) | Planned |
-| Alerts | Local UI alert only | Planned |
-| Config | Segment length / confidence threshold UI controls | Planned |
-| Offline | Full offline recording & later sync (future) | Deferred |
+| Category | Feature | Status | Notes |
+|----------|---------|--------|-------|
+| Capture | Start/stop session | Implemented | FastAPI endpoints plus the browser control panel handle create/stop flows (`app/main.py`, `app/frontend/static/app.js`). |
+| Capture | Continuous AV segmentation | Backend stub only | `ContinuousCaptureBackend` writes synthetic PCM files, but the browser never captures MediaStream input yet. |
+| Sensors | GPS + orientation capture | Not implemented | UI payload sends hard-coded Amsterdam coordinates and heading values. |
+| Inference | Local audio event classification | Stubbed | Backend fabricates a single `ambient_noise` detection per segment without model execution. |
+| Inference | Local video action recognition (lightweight) | Not implemented | No video processing or model loading logic exists. |
+| Detection | Fight / Robbery / Fireworks / Gunshot / Scream / Glass Break / Vehicle Crash | Not implemented | Only the placeholder `ambient_noise` class is produced; planned incident classes are absent in API/UI. |
+| UX | Real-time detection overlay + confidence | Not implemented | Control panel shows session metadata only and lacks detection visualisation. |
+| Storage | Local file + metadata store (IndexedDB / File System Access API) | Not implemented on client | Persistence currently happens server-side (SQLite + `recordings/`), with no browser-side IndexedDB/File System Access usage. |
+| Alerts | Local UI alert only | Not implemented | No detection-triggered notifications beyond generic status text. |
+| Config | Segment length / confidence threshold UI controls | Not implemented | Payload uses fixed defaults in `buildSessionPayload`; there are no configurable inputs. |
+| Offline | Full offline recording & later sync (future) | Deferred | Still a later-phase deliverable once client-side capture exists. |
 
 ## 6. Architecture (MVP Concept)
 ```
