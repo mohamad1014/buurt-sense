@@ -11,6 +11,11 @@ let pollingTimer = null;
 let longPollController = null;
 let lastRevision = null;
 let shuttingDown = false;
+const captureState = {
+  context: null,
+  uploads: [],
+  orientationPermissionRequested: false,
+};
 
 function formatTimestamp(timestamp) {
   if (!timestamp) {
@@ -146,17 +151,326 @@ async function startSession() {
   try {
     setStatus("Starting session…");
     startButton.disabled = true;
-    const session = await fetchJson("/sessions", { method: "POST" });
+    const sessionPayload = await buildSessionPayload();
+    const session = await fetchJson("/sessions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(sessionPayload),
+    });
     activeSession = session;
     renderActiveSession(session);
     toggleButtons(true);
-    setStatus("Session started. Recording in progress.", "success");
+    let captureError = null;
+    try {
+      await startMediaCapture(session);
+    } catch (error) {
+      captureError = error;
+      console.warn("Media capture unavailable", error);
+    }
     await loadSessions({ announce: false });
+    if (captureError) {
+      setStatus(
+        `Session started, but media capture failed: ${captureError.message}`,
+        "warning",
+      );
+    } else {
+      setStatus("Session started. Recording in progress.", "success");
+    }
   } catch (error) {
     console.error("Failed to start session", error);
     setStatus(`Unable to start session: ${error.message}`, "error");
     startButton.disabled = false;
   }
+}
+
+async function buildSessionPayload() {
+  const now = new Date();
+  const defaults = {
+    lat: 52.3676,
+    lon: 4.9041,
+    accuracy_m: 5,
+    orientation_heading_deg: 0,
+  };
+
+  const gpsOrigin = await resolveGpsOrigin(now, defaults);
+  const orientationOrigin = await resolveOrientationOrigin(now, defaults);
+
+  return {
+    started_at: now.toISOString(),
+    operator_alias: "Browser Operator",
+    notes: "Started from local UI",
+    app_version: "web-ui",
+    model_bundle_version: "demo",
+    gps_origin: gpsOrigin,
+    orientation_origin: orientationOrigin,
+    config_snapshot: {
+      segment_length_sec: 30,
+      overlap_sec: 5,
+      confidence_threshold: 0.6,
+    },
+    detection_summary: {
+      total_detections: 0,
+      by_class: {},
+    },
+    redact_location: false,
+  };
+}
+
+function supportsGeolocation() {
+  return Boolean(navigator?.geolocation);
+}
+
+async function resolveGpsOrigin(now, defaults) {
+  if (!supportsGeolocation()) {
+    return {
+      lat: defaults.lat,
+      lon: defaults.lon,
+      accuracy_m: defaults.accuracy_m,
+      captured_at: now.toISOString(),
+    };
+  }
+
+  try {
+    const position = await new Promise((resolve, reject) => {
+      navigator.geolocation.getCurrentPosition(resolve, reject, {
+        enableHighAccuracy: true,
+        timeout: 8000,
+        maximumAge: 10000,
+      });
+    });
+
+    return {
+      lat: position.coords.latitude,
+      lon: position.coords.longitude,
+      accuracy_m: position.coords.accuracy,
+      captured_at: new Date(position.timestamp || Date.now()).toISOString(),
+    };
+  } catch (error) {
+    console.warn("Geolocation unavailable", error);
+    return {
+      lat: defaults.lat,
+      lon: defaults.lon,
+      accuracy_m: defaults.accuracy_m,
+      captured_at: now.toISOString(),
+    };
+  }
+}
+
+async function resolveOrientationOrigin(now, defaults) {
+  if (typeof window === "undefined" || !("DeviceOrientationEvent" in window)) {
+    return {
+      heading_deg: defaults.orientation_heading_deg,
+      captured_at: now.toISOString(),
+    };
+  }
+
+  if (
+    typeof DeviceOrientationEvent.requestPermission === "function" &&
+    !captureState.orientationPermissionRequested
+  ) {
+    captureState.orientationPermissionRequested = true;
+    try {
+      const permission = await DeviceOrientationEvent.requestPermission();
+      if (permission !== "granted") {
+        return {
+          heading_deg: defaults.orientation_heading_deg,
+          captured_at: now.toISOString(),
+        };
+      }
+    } catch (error) {
+      console.warn("Orientation permission denied", error);
+      return {
+        heading_deg: defaults.orientation_heading_deg,
+        captured_at: now.toISOString(),
+      };
+    }
+  }
+
+  const reading = await new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      window.removeEventListener("deviceorientation", handler);
+      resolve(null);
+    }, 2000);
+
+    function handler(event) {
+      clearTimeout(timeout);
+      window.removeEventListener("deviceorientation", handler);
+      resolve(event);
+    }
+
+    window.addEventListener("deviceorientation", handler, { once: true });
+  });
+
+  if (!reading) {
+    return {
+      heading_deg: defaults.orientation_heading_deg,
+      captured_at: now.toISOString(),
+    };
+  }
+
+  return {
+    heading_deg: reading.alpha ?? defaults.orientation_heading_deg,
+    pitch_deg: reading.beta ?? null,
+    roll_deg: reading.gamma ?? null,
+    captured_at: new Date().toISOString(),
+  };
+}
+
+function supportsMediaCapture() {
+  return Boolean(navigator?.mediaDevices?.getUserMedia && window.MediaRecorder);
+}
+
+async function startMediaCapture(session) {
+  if (!supportsMediaCapture()) {
+    throw new Error(
+      "Media capture is not supported by this browser; uploads disabled.",
+    );
+  }
+
+  if (captureState.context) {
+    await stopMediaCapture();
+  }
+
+  const segmentLengthSec =
+    session?.config_snapshot?.segment_length_sec ?? 30;
+  const segmentLengthMs = Math.max(segmentLengthSec * 1000, 1000);
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: true,
+    video: {
+      facingMode: "environment",
+      width: { ideal: 1280 },
+      height: { ideal: 720 },
+    },
+  });
+  const options = resolveRecorderOptions(stream);
+  const recorder = new MediaRecorder(stream, options);
+  const context = {
+    sessionId: session.id,
+    recorder,
+    stream,
+    segmentIndex: 0,
+    segmentLengthMs,
+    segmentStart: null,
+  };
+
+  recorder.addEventListener("start", () => {
+    context.segmentStart = new Date();
+  });
+
+  recorder.addEventListener("dataavailable", (event) => {
+    if (!event.data || event.data.size === 0) {
+      context.segmentStart = new Date();
+      return;
+    }
+    const start = context.segmentStart ?? new Date();
+    const end = new Date();
+    context.segmentStart = end;
+    const uploadPromise = uploadSegmentBlob(
+      context.sessionId,
+      context.segmentIndex,
+      start,
+      end,
+      event.data,
+    );
+    captureState.uploads.push(uploadPromise);
+    uploadPromise
+      .catch((error) => {
+        console.error("Segment upload failed", error);
+        setStatus(`Segment upload failed: ${error.message}`, "error");
+      })
+      .finally(() => {
+        captureState.uploads = captureState.uploads.filter(
+          (pending) => pending !== uploadPromise,
+        );
+      });
+    context.segmentIndex += 1;
+  });
+
+  recorder.addEventListener("error", (event) => {
+    const message = event.error?.message || "Recorder error";
+    console.error("Recorder error", event.error);
+    setStatus(`Recorder error: ${message}`, "error");
+  });
+
+  try {
+    recorder.start(segmentLengthMs);
+  } catch (error) {
+    stream.getTracks().forEach((track) => track.stop());
+    throw error;
+  }
+  captureState.context = context;
+}
+
+function resolveRecorderOptions(stream) {
+  if (typeof MediaRecorder === "undefined") {
+    return {};
+  }
+
+  const hasVideo = stream.getVideoTracks().length > 0;
+  const candidates = hasVideo
+    ? [
+        "video/webm;codecs=vp9,opus",
+        "video/webm;codecs=vp8,opus",
+        "video/webm",
+        "video/mp4",
+      ]
+    : ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
+
+  const supported = candidates.find((type) =>
+    MediaRecorder.isTypeSupported?.(type),
+  );
+
+  return supported ? { mimeType: supported } : {};
+}
+
+async function stopMediaCapture() {
+  const context = captureState.context;
+  if (!context) {
+    return;
+  }
+
+  captureState.context = null;
+  const { recorder, stream } = context;
+  const stopPromise = new Promise((resolve) => {
+    if (recorder.state === "inactive") {
+      resolve();
+      return;
+    }
+    recorder.addEventListener("stop", resolve, { once: true });
+  });
+  if (recorder.state !== "inactive") {
+    recorder.stop();
+  }
+  stream.getTracks().forEach((track) => track.stop());
+  await stopPromise;
+
+  if (captureState.uploads.length) {
+    const pending = [...captureState.uploads];
+    captureState.uploads = [];
+    await Promise.allSettled(pending);
+  }
+}
+
+async function uploadSegmentBlob(sessionId, index, startTs, endTs, blob) {
+  const formData = new FormData();
+  formData.append("index", String(index));
+  formData.append("start_ts", startTs.toISOString());
+  formData.append("end_ts", endTs.toISOString());
+  formData.append(
+    "file",
+    blob,
+    `segment-${String(index).padStart(4, "0")}.webm`,
+  );
+
+  const response = await fetch(`/sessions/${sessionId}/segments/upload`, {
+    method: "POST",
+    body: formData,
+  });
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(detail || response.statusText);
+  }
+  return response.json();
 }
 
 async function stopSession() {
@@ -168,6 +482,7 @@ async function stopSession() {
   try {
     setStatus("Stopping session…");
     stopButton.disabled = true;
+    await stopMediaCapture();
     const session = await fetchJson(`/sessions/${activeSession.id}/stop`, {
       method: "POST",
     });
@@ -299,6 +614,9 @@ function setupLiveUpdates() {
 
 function cleanupLiveUpdates() {
   shuttingDown = true;
+  stopMediaCapture().catch((error) => {
+    console.error("Failed to stop media capture", error);
+  });
   stopPolling();
   stopLongPolling();
   if (liveWebSocket) {

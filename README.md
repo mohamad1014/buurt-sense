@@ -22,6 +22,22 @@ uv run uvicorn --factory app.main:create_app --reload --host 0.0.0.0 --port 8000
 
 Once the server is running, visit `http://localhost:8000/` for the recording control panel or `http://localhost:8000/docs` for the automatically generated Swagger UI.
 
+### Browser Session Defaults
+
+The "Start session" button in the bundled UI now sends a complete JSON payload with placeholder metadata (demo operator alias, Amsterdam GPS, and default config snapshot). This keeps the UX friction-free while still satisfying the backend schema requirements. If you want the button to emit different defaults, edit `buildSessionPayload()` in `app/frontend/static/app.js` (for example to plug in real device info or GPS coordinates) or replace the UI with your own client that submits customized payloads.
+
+### Recording Backend Configuration
+
+The default recording backend now captures media segments continuously while sessions are active and stores them on disk. Configure its behaviour with the following environment variables:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `BUURT_CAPTURE_ROOT` | Root directory where segment files are written. | `recordings` (relative to the working directory) |
+| `BUURT_SEGMENT_LENGTH_SEC` | Target duration, in seconds, for each generated segment. | `5.0` |
+| `BUURT_SEGMENT_BYTES_PER_SEC` | Approximate bytes written per second of captured media (controls file size). | `32000` |
+
+Segments are streamed into `<BUURT_CAPTURE_ROOT>/<session-id>/segment-XXXX.pcm` and detections are emitted in real time while the session is running.
+
 ## Running Tests
 
 Install dependencies with [uv](https://docs.astral.sh/uv/) and execute the pytest suite to validate the API behaviour:
@@ -35,6 +51,20 @@ uv run --extra dev pytest
 ```
 
 `uv sync --extra dev` creates a project-local virtual environment automatically (default: `.venv`) with both runtime and development dependencies. You do not need to activate it manually; `uv run` handles environment resolution for each command.
+
+## Database Migrations
+
+The project uses [Alembic](https://alembic.sqlalchemy.org/) for schema management. Set `BUURTSENSE_DB_URL` to point at your database (defaults to the SQLite file `sqlite+aiosqlite:///./buurtsense.db`). Run migrations with either the helper script or Alembic CLI:
+
+```bash
+# Apply all pending migrations using the helper script
+uv run python scripts/init_db.py
+
+# Or run Alembic directly
+uv run alembic upgrade head
+```
+
+You can inspect the generated SQL with `uv run alembic history` and create new revisions via `uv run alembic revision -m "message"` once your models change.
 
 ### Test Coverage
 
@@ -79,19 +109,19 @@ Excluded (Future Phases):
 - Local authority liaison (future: dashboard consumption).
 
 ## 5. Key Features (MVP)
-| Category | Feature | Status |
-|----------|---------|--------|
-| Capture | Start/stop session | Planned |
-| Capture | Continuous AV segmentation | Planned |
-| Sensors | GPS + orientation capture | Planned |
-| Inference | Local audio event classification | Planned |
-| Inference | Local video action recognition (lightweight) | Planned |
-| Detection | Fight / Robbery / Fireworks / Gunshot / Scream / Glass Break / Vehicle Crash | Planned |
-| UX | Real-time detection overlay + confidence | Planned |
-| Storage | Local file + metadata store (IndexedDB / File System Access API) | Planned |
-| Alerts | Local UI alert only | Planned |
-| Config | Segment length / confidence threshold UI controls | Planned |
-| Offline | Full offline recording & later sync (future) | Deferred |
+| Category | Feature | Status | Notes |
+|----------|---------|--------|-------|
+| Capture | Start/stop session | Implemented | FastAPI endpoints plus the browser control panel handle create/stop flows (`app/main.py`, `app/frontend/static/app.js`). |
+| Capture | Continuous AV segmentation | Partial (browser audio) | The control panel now streams live microphone audio via `MediaRecorder` and uploads segments to `/sessions/{id}/segments/upload`; the backend synthesiser remains as a fallback when capture is unavailable. |
+| Sensors | GPS + orientation capture | Partial (browser APIs) | Control panel now requests geolocation + device orientation on session start and falls back to Amsterdam defaults when permissions are denied. |
+| Inference | Local audio event classification | Stubbed | Backend fabricates a single `ambient_noise` detection per segment without model execution. |
+| Inference | Local video action recognition (lightweight) | Not implemented | No video processing or model loading logic exists. |
+| Detection | Fight / Robbery / Fireworks / Gunshot / Scream / Glass Break / Vehicle Crash | Not implemented | Only the placeholder `ambient_noise` class is produced; planned incident classes are absent in API/UI. |
+| UX | Real-time detection overlay + confidence | Not implemented | Control panel shows session metadata only and lacks detection visualisation. |
+| Storage | Local file + metadata store (IndexedDB / File System Access API) | Not implemented on client | Persistence currently happens server-side (SQLite + `recordings/`), with no browser-side IndexedDB/File System Access usage. |
+| Alerts | Local UI alert only | Not implemented | No detection-triggered notifications beyond generic status text. |
+| Config | Segment length / confidence threshold UI controls | Not implemented | Payload uses fixed defaults in `buildSessionPayload`; there are no configurable inputs. |
+| Offline | Full offline recording & later sync (future) | Deferred | Still a later-phase deliverable once client-side capture exists. |
 
 ## 6. Architecture (MVP Concept)
 ```
@@ -132,7 +162,8 @@ TBD after tech stack decision.
 - **Pragmas**: WAL + foreign-key enforcement for resilience and concurrency
 - **Tables**: `recording_sessions`, `segments`, `detections`
 - **Access Layer**: `SessionStorage` facade for session lifecycle, segments, and detections
-- **Initialization**: `python scripts/init_db.py`
+- **Initialization**: `uv run python scripts/init_db.py` (applies Alembic migrations)
+- **Configuration**: `BUURTSENSE_DB_URL` points at the runtime database (default: `sqlite+aiosqlite:///./buurtsense.db`)
 
 ### Model Strategy (Revised)
 - **Primary Detection**: Lightweight local models for initial screening
@@ -373,6 +404,7 @@ uv run uvicorn --factory app.main:create_app --reload
 | `GET /sessions` | List sessions with rounded origin coordinates, config snapshot, and detection summary counts. Includes a `status` flag (`active` / `completed`). |
 | `GET /sessions/{id}` | Retrieve full session metadata including segments. Use `expand=traces` to include GPS & orientation traces and `include=full_detections` to inline detections. |
 | `POST /sessions/{id}/segments` | Attach a media segment to a session along with traces, checksum, and sizing info. |
+| `POST /sessions/{id}/segments/upload` | Upload an audio/video blob directly from the browser; the backend stores it under the capture root and persists the derived metadata. |
 | `GET /sessions/{id}/detections` | Paginate detections associated with a session. |
 | `POST /segments/{id}/detections` | Add a detection and automatically refresh the session’s aggregated detection summary (totals, per-class counts, first/last timestamps, highest-confidence detection). |
 

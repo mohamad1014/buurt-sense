@@ -210,3 +210,6 @@ __marimo__/
 # Local DB files
 *.sqlite
 *.db
+
+# recordings
+recordings/

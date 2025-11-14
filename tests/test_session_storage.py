@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from app.storage import ContinuousCaptureBackend
 from buurtsense.storage import (
     DetectionCreate,
     RecordingSessionCreate,
@@ -53,3 +54,30 @@ async def test_session_lifecycle(tmp_path):
     assert fetched.segments[0].detections[0].label == "gunshot"
 
     await storage.close()
+
+
+def test_capture_backend_uses_environment_overrides(monkeypatch, tmp_path):
+    capture_root = tmp_path / "custom-captures"
+    monkeypatch.setenv("BUURT_CAPTURE_ROOT", str(capture_root))
+    monkeypatch.setenv("BUURT_SEGMENT_LENGTH_SEC", "1.25")
+    monkeypatch.setenv("BUURT_SEGMENT_BYTES_PER_SEC", "2048")
+
+    backend = ContinuousCaptureBackend(store=None)
+
+    assert backend._capture_root == capture_root.resolve()
+    assert backend._segment_length == pytest.approx(1.25)
+    assert backend._bytes_per_second == 2048
+
+
+def test_capture_backend_prefers_explicit_parameters(tmp_path):
+    capture_root = tmp_path / "explicit"
+    backend = ContinuousCaptureBackend(
+        store=None,
+        capture_root=capture_root,
+        segment_length=3.5,
+        bytes_per_second=8192,
+    )
+
+    assert backend._capture_root == capture_root.resolve()
+    assert backend._segment_length == pytest.approx(3.5)
+    assert backend._bytes_per_second == 8192
