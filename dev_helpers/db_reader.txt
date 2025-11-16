@@ -1,0 +1,9 @@
+python3 - <<'PY'
+import sqlite3
+conn = sqlite3.connect("buurtsense.db")
+conn.row_factory = sqlite3.Row
+for row in conn.execute("SELECT * FROM recording_sessions"):
+    print(dict(row))
+for row in conn.execute('SELECT * FROM segments'):
+    print(dict(row))
+PY

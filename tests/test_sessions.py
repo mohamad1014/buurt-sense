@@ -82,6 +82,7 @@ def make_frontend_payload() -> dict[str, Any]:
             "by_class": {},
         },
         "redact_location": False,
+        "skip_backend_capture": True,
     }
 
 
@@ -294,6 +295,30 @@ def test_backend_stream_persists_segments_and_detections(
     assert db_segment.audio_duration_ms is not None and db_segment.audio_duration_ms > 0
     assert db_segment.checksum, "checksum should be stored in the database"
     assert db_segment.size_bytes is not None and db_segment.size_bytes > 0
+
+
+def test_skip_backend_capture_flag_disables_backend(client: TestClient) -> None:
+    """Sessions can opt out of the synthetic capture backend."""
+
+    payload = make_session_payload()
+    payload["skip_backend_capture"] = True
+    response = client.post("/sessions", json=payload)
+    assert response.status_code == 201
+    session = validate_session_payload(response.json())
+
+    time.sleep(0.35)
+
+    stop_response = client.post(f"/sessions/{session.id}/stop")
+    assert stop_response.status_code == 200
+
+    detail_response = client.get(f"/sessions/{session.id}/detail")
+    assert detail_response.status_code == 200
+    detail = detail_response.json()
+
+    assert detail.get("segments", []) == []
+    assert detail.get("detections", []) == []
+    summary = detail.get("detection_summary") or {}
+    assert summary.get("total_detections", 0) == 0
 
 
 def test_stopping_unknown_session_returns_not_found(client: TestClient) -> None:

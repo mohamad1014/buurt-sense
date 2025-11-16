@@ -4,11 +4,12 @@ AI-powered neighbourhood awareness platform. Empowers communities to record and 
 
 ## Current Code Status
 
-- ✅ **FastAPI backend skeleton** with endpoints to create, stop, retrieve, and list recording sessions backed by an in-memory store (`app/main.py`, `app/storage.py`).
-- ✅ **Browser control panel** to start/stop sessions and view history, served at the root path (`app/frontend`).
+- ✅ **FastAPI backend** with endpoints to create/stop/list sessions plus segment and detection ingestion, persisted to SQLite via `SessionStorage` (`app/main.py`, `app/storage.py`).
+- ✅ **Browser control panel** to start/stop sessions, view history, and upload MediaRecorder segments to `/sessions/{id}/segments/upload` (`app/frontend`).
+- ✅ **Local persistence** of recorded artifacts and metadata (SQLite at `buurtsense.db` + media under `recordings/<session-id>/`).
 - ✅ **Pydantic session model** that enforces timezone-aware timestamps (`app/models.py`).
 - ✅ **Comprehensive pytest suite** covering the session lifecycle and error handling (`tests/test_sessions.py`).
-- ⚠️ **No production persistence or frontend yet**—all data is lost when the process stops, and the roadmap items below remain planned work.
+- ⚠️ **Not production-ready**—no auth/multi-user flows, inference is stubbed, and data lives only on the local machine; roadmap items below remain planned work.
 
 ## Running the Local API
 
@@ -25,6 +26,22 @@ Once the server is running, visit `http://localhost:8000/` for the recording con
 ### Browser Session Defaults
 
 The "Start session" button in the bundled UI now sends a complete JSON payload with placeholder metadata (demo operator alias, Amsterdam GPS, and default config snapshot). This keeps the UX friction-free while still satisfying the backend schema requirements. If you want the button to emit different defaults, edit `buildSessionPayload()` in `app/frontend/static/app.js` (for example to plug in real device info or GPS coordinates) or replace the UI with your own client that submits customized payloads.
+
+When the browser performs the actual media capture, the payload also includes `skip_backend_capture: true`. This flag tells the server to disable its synthetic capture backend for that session so your uploads do not collide with the demo generator. Remove it (or set to `false`) if you want the backend to fabricate placeholder segments and detections automatically.
+
+### Testing on other devices with ngrok
+
+Expose your local server to phones or other machines on the same network via ngrok:
+
+```bash
+# In one terminal: run the API
+uv run uvicorn --factory app.main:create_app --reload --host 0.0.0.0 --port 8000
+
+# In another terminal: create a tunnel
+ngrok http 8000
+```
+
+Use the HTTPS forwarding URL printed by ngrok (e.g., `https://<name>.ngrok-free.dev`) in your mobile browser to open the control panel and exercise start/stop + uploads remotely. The free plan may emit warning banners in the console; they are safe to ignore for ad-hoc testing.
 
 ### Recording Backend Configuration
 
