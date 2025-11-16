@@ -213,6 +213,7 @@ async function buildSessionPayload() {
       by_class: {},
     },
     redact_location: false,
+    skip_backend_capture: true,
   };
 }
 

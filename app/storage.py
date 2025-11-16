@@ -403,6 +403,7 @@ class SessionStore:
         """Persist a new session and trigger the recording backend."""
 
         await self.initialize()
+        skip_backend_capture = bool(getattr(payload, "skip_backend_capture", False))
         started_at = self._normalize_datetime(
             payload.started_at, field="started_at", required=True
         )
@@ -446,7 +447,8 @@ class SessionStore:
                 redact_location=payload.redact_location,
             )
         )
-        await self._backend.start(record.id, started_at=started_at)
+        if not skip_backend_capture:
+            await self._backend.start(record.id, started_at=started_at)
         session = self._to_session(record)
         await self._broadcast()
         return session

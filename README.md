@@ -26,6 +26,8 @@ Once the server is running, visit `http://localhost:8000/` for the recording con
 
 The "Start session" button in the bundled UI now sends a complete JSON payload with placeholder metadata (demo operator alias, Amsterdam GPS, and default config snapshot). This keeps the UX friction-free while still satisfying the backend schema requirements. If you want the button to emit different defaults, edit `buildSessionPayload()` in `app/frontend/static/app.js` (for example to plug in real device info or GPS coordinates) or replace the UI with your own client that submits customized payloads.
 
+When the browser performs the actual media capture, the payload also includes `skip_backend_capture: true`. This flag tells the server to disable its synthetic capture backend for that session so your uploads do not collide with the demo generator. Remove it (or set to `false`) if you want the backend to fabricate placeholder segments and detections automatically.
+
 ### Recording Backend Configuration
 
 The default recording backend now captures media segments continuously while sessions are active and stores them on disk. Configure its behaviour with the following environment variables:

@@ -95,6 +95,7 @@ class SessionBase(BaseModel):
 class SessionCreate(SessionBase):
     device_id: Optional[uuid.UUID] = None
     device_info: Optional[Dict[str, Any]] = None
+    skip_backend_capture: bool = False
 
 
 class SessionRead(SessionBase):
