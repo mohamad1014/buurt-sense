@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -15,6 +16,12 @@ from uuid import UUID, uuid4
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
 
+from .inference import (
+    DetectionState,
+    InferenceConfig,
+    InferenceEngine,
+    SegmentInferenceInput,
+)
 from buurtsense.storage import (
     DetectionCreate as StorageDetectionCreate,
     RecordingSessionCreate,
@@ -32,6 +39,8 @@ from .schemas import SegmentCreate as SegmentCreateSchema
 from .schemas import SegmentRead
 from .schemas import SessionCreate, SessionDetail
 from .utils import derive_timezone, ensure_detection_summary
+
+LOG = logging.getLogger(__name__)
 
 
 class SessionNotFoundError(KeyError):
@@ -79,6 +88,8 @@ class _CaptureWorker:
     stop_event: asyncio.Event = field(default_factory=asyncio.Event)
     ended_at: datetime | None = None
     task: asyncio.Task[None] | None = None
+    config_snapshot: Dict[str, Any] = field(default_factory=dict)
+    detection_state: DetectionState = field(default_factory=DetectionState)
 
     def request_stop(self, ended_at: datetime) -> None:
         """Signal the worker to finalise capture with the provided timestamp."""
@@ -116,6 +127,7 @@ class ContinuousCaptureBackend:
         self._store = store
         self._capture_root = resolve_capture_root(capture_root)
         self._capture_root.mkdir(parents=True, exist_ok=True)
+        self._inference = InferenceEngine(InferenceConfig())
 
         env_length = os.environ.get("BUURT_SEGMENT_LENGTH_SEC")
         self._segment_length = segment_length or float(env_length or 5.0)
@@ -142,6 +154,19 @@ class ContinuousCaptureBackend:
             if session_id in self._workers:
                 raise RuntimeError(f"session {session_id} already capturing")
             worker = _CaptureWorker(session_id=session_id, started_at=started_at)
+            try:
+                session = await self._store.get(UUID(session_id))
+                snapshot = jsonable_encoder(
+                    getattr(session, "config_snapshot", None), exclude_none=True
+                )
+                if isinstance(snapshot, Mapping):
+                    worker.config_snapshot = dict(snapshot)
+            except Exception as exc:  # pragma: no cover - defensive lookup
+                LOG.debug(
+                    "Unable to load config snapshot for session %s",
+                    session_id,
+                    exc_info=exc,
+                )
             self._workers[session_id] = worker
             worker.task = asyncio.create_task(self._run_capture(worker))
 
@@ -199,7 +224,7 @@ class ContinuousCaptureBackend:
             segment_id = UUID(str(segment_data["id"]))
 
             detections = await self._infer_segment(
-                session_uuid, segment_id, index, artifact
+                worker, session_uuid, segment_id, artifact
             )
             for detection in detections:
                 await self._store.create_detection(segment_id, detection)
@@ -263,23 +288,29 @@ class ContinuousCaptureBackend:
 
     async def _infer_segment(
         self,
+        worker: _CaptureWorker,
         session_id: UUID,
         segment_id: UUID,
-        index: int,
         artifact: _SegmentArtifact,
     ) -> list[DetectionCreateSchema]:
-        """Produce lightweight detections for a persisted segment."""
+        """Produce detections for a persisted segment using the inference engine."""
 
-        confidence = min(0.95, 0.55 + (index * 0.05))
-        latency_ms = max(int(self._segment_length * 250), 1)
-        detection = DetectionCreateSchema(
-            detection_class="ambient_noise",
-            confidence=confidence,
-            timestamp=artifact.end_ts,
-            inference_latency_ms=latency_ms,
-            model_id="local-audio-v1",
+        request = SegmentInferenceInput(
+            session_id=session_id,
+            segment_id=segment_id,
+            file_path=artifact.file_path,
+            start_ts=artifact.start_ts,
+            end_ts=artifact.end_ts,
+            frame_count=artifact.frame_count,
+            audio_duration_ms=artifact.audio_duration_ms,
+            size_bytes=artifact.size_bytes,
         )
-        return [detection]
+        return await asyncio.to_thread(
+            self._inference.detect,
+            request,
+            session_config=worker.config_snapshot,
+            state=worker.detection_state,
+        )
 
 
 @dataclass(slots=True)
