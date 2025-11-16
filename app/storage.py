@@ -127,7 +127,7 @@ class ContinuousCaptureBackend:
         self._store = store
         self._capture_root = resolve_capture_root(capture_root)
         self._capture_root.mkdir(parents=True, exist_ok=True)
-        self._inference = InferenceEngine(InferenceConfig())
+        self._inference = InferenceEngine(InferenceConfig.from_env())
 
         env_length = os.environ.get("BUURT_SEGMENT_LENGTH_SEC")
         self._segment_length = segment_length or float(env_length or 5.0)
@@ -148,6 +148,11 @@ class ContinuousCaptureBackend:
         """Rebind the backend to a different session store instance."""
 
         self._store = store
+
+    def stats(self) -> Mapping[str, int]:
+        """Return inference counters for observability."""
+
+        return self._inference.stats()
 
     async def start(self, session_id: str, *, started_at: datetime) -> None:
         async with self._lock:
@@ -398,6 +403,14 @@ class SessionStore:
         """Expose the underlying :class:`SessionStorage` for inspection/tests."""
 
         return self._storage
+
+    def inference_stats(self) -> Mapping[str, int]:
+        """Expose inference metrics when the backend supports them."""
+
+        stats_getter = getattr(self._backend, "stats", None)
+        if callable(stats_getter):
+            return stats_getter()
+        return {}
 
     async def __aenter__(self) -> "SessionStore":
         await self.initialize()

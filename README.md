@@ -260,6 +260,7 @@ Phase 3: Advanced analytics (heatmaps, temporal trends, predictive modeling), mo
 - **Imminent validation**: flesh out backend unit and integration tests that cover session lifecycle endpoints and health reporting.
 - **Upcoming refactor**: extract a storage abstraction layer to support swapping local development storage for cloud backends without touching route logic.
 - **Future persistence**: design durable session archival (object storage + metadata DB) once on-device retention limits are defined.
+- **Inference config**: toggle audio/video detectors and thresholds via environment flags (`BUURT_ENABLE_AUDIO_INFER`, `BUURT_ENABLE_VIDEO_INFER`, `BUURT_INFER_THRESHOLD`, `BUURT_CLASS_COOLDOWN_SEC`, `BUURT_AUDIO_MODEL_ID`, `BUURT_VIDEO_MODEL_ID`). `/health` now returns inference stats for quick observability.
 
 ## 15. Installation (Draft Placeholder)
 Prerequisites:

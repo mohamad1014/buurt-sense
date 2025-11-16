@@ -95,10 +95,15 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
     app.state.session_store = store
 
     @app.get("/health")
-    def health() -> dict[str, str]:
+    def health() -> dict[str, object]:
         """Return a simple health status payload."""
 
-        return {"status": "ok"}
+        payload: dict[str, object] = {"status": "ok"}
+        try:
+            payload["inference"] = store.inference_stats()
+        except Exception:  # pragma: no cover - defensive
+            payload["inference"] = {}
+        return payload
 
     @app.post("/sessions", status_code=status.HTTP_201_CREATED)
     async def create_session(payload: SessionCreate) -> Session:

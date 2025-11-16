@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -35,6 +36,43 @@ class InferenceConfig:
         if fallback is not None:
             return fallback
         return self.global_threshold
+
+    @classmethod
+    def from_env(cls) -> "InferenceConfig":
+        """Build a config instance from environment overrides."""
+
+        def _bool(name: str, default: bool) -> bool:
+            raw = os.environ.get(name)
+            if raw is None:
+                return default
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+        def _float(name: str, default: float) -> float:
+            raw = os.environ.get(name)
+            if raw is None:
+                return default
+            try:
+                return float(raw)
+            except ValueError:
+                return default
+
+        def _int(name: str, default: int) -> int:
+            raw = os.environ.get(name)
+            if raw is None:
+                return default
+            try:
+                return int(raw)
+            except ValueError:
+                return default
+
+        return cls(
+            global_threshold=_float("BUURT_INFER_THRESHOLD", 0.6),
+            class_cooldown_sec=_int("BUURT_CLASS_COOLDOWN_SEC", 30),
+            enable_audio=_bool("BUURT_ENABLE_AUDIO_INFER", True),
+            enable_video=_bool("BUURT_ENABLE_VIDEO_INFER", True),
+            audio_model_id=os.environ.get("BUURT_AUDIO_MODEL_ID", "yamnet-small"),
+            video_model_id=os.environ.get("BUURT_VIDEO_MODEL_ID", "yolo-v8n-quant"),
+        )
 
 
 @dataclass(slots=True)
