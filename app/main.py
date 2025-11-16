@@ -100,7 +100,7 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
 
         payload: dict[str, object] = {"status": "ok"}
         try:
-            payload["inference"] = store.inference_stats()
+            payload["inference"] = store.inference_status()
         except Exception:  # pragma: no cover - defensive
             payload["inference"] = {}
         return payload

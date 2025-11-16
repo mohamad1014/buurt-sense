@@ -152,7 +152,14 @@ class ContinuousCaptureBackend:
     def stats(self) -> Mapping[str, int]:
         """Return inference counters for observability."""
 
-        return self._inference.stats()
+        status = self._inference.status()
+        counters = status.get("counters", {})
+        return counters if isinstance(counters, Mapping) else {}
+
+    def status(self) -> Mapping[str, object]:
+        """Return full inference status including readiness metadata."""
+
+        return self._inference.status()
 
     async def start(self, session_id: str, *, started_at: datetime) -> None:
         async with self._lock:
@@ -410,6 +417,14 @@ class SessionStore:
         stats_getter = getattr(self._backend, "stats", None)
         if callable(stats_getter):
             return stats_getter()
+        return {}
+
+    def inference_status(self) -> Mapping[str, object]:
+        """Expose detailed inference status, including detector readiness."""
+
+        status_getter = getattr(self._backend, "status", None)
+        if callable(status_getter):
+            return status_getter()
         return {}
 
     async def __aenter__(self) -> "SessionStore":

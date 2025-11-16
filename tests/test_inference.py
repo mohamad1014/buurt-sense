@@ -85,3 +85,14 @@ def test_session_config_overrides_threshold_and_cooldown(tmp_path) -> None:
     assert detections, "at least one detection should be emitted"
     model_ids = {item.model_id for item in detections}
     assert model_ids <= {"yamnet-small", "yolo-v8n-quant"}
+
+
+def test_status_exposes_readiness() -> None:
+    """Inference status should report detector readiness even when stubbed."""
+
+    engine = InferenceEngine()
+    status = engine.status()
+    assert "audio" in status and "video" in status
+    assert isinstance(status["audio"].get("enabled"), bool)
+    assert "ready" in status["audio"]
+    assert "model_id" in status["audio"]
