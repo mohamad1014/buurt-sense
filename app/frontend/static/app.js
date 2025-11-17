@@ -17,6 +17,25 @@ const captureState = {
   orientationPermissionRequested: false,
 };
 
+const inferenceState = {
+  audioModel: null,
+  videoModel: null,
+  runtimeReady: false,
+  loading: false,
+  audioModelUrl:
+    window.BUURT_AUDIO_MODEL_URL || "/static/tflite/YamNet_float.tflite",
+  videoModelUrl:
+    window.BUURT_VIDEO_MODEL_URL ||
+    "https://huggingface.co/qualcomm/Yolo-X/resolve/main/Yolo-X_float.tflite?download=true",
+  audioModelId: "yamnet-client-tfjs",
+  videoModelId: "yolox-client-tfjs",
+  wasmBaseUrl: "/static/tflite",
+  classMap: [],
+  classMapUrl:
+    window.BUURT_YAMNET_CLASS_MAP_URL ||
+    "https://raw.githubusercontent.com/tensorflow/models/master/research/audioset/yamnet/yamnet_class_map.csv",
+};
+
 function formatTimestamp(timestamp) {
   if (!timestamp) {
     return "--";
@@ -132,6 +151,17 @@ async function fetchJson(url, options) {
   return response.json();
 }
 
+async function getMobileDetections(blob, startTs, endTs, index) {
+  try {
+    await ensureInferenceRuntime();
+    const audioDetections = await runAudioInference(blob, endTs);
+    return audioDetections;
+  } catch (error) {
+    console.warn("Mobile inference unavailable, skipping detections", error);
+    return [];
+  }
+}
+
 async function loadSessions(options = {}) {
   const announce = options.announce ?? true;
   try {
@@ -206,7 +236,7 @@ async function buildSessionPayload() {
     config_snapshot: {
       segment_length_sec: 30,
       overlap_sec: 5,
-      confidence_threshold: 0.6,
+      confidence_threshold: 0.1,
     },
     detection_summary: {
       total_detections: 0,
@@ -463,6 +493,11 @@ async function uploadSegmentBlob(sessionId, index, startTs, endTs, blob) {
     `segment-${String(index).padStart(4, "0")}.webm`,
   );
 
+  const detections = await getMobileDetections(blob, startTs, endTs, index);
+  if (detections && detections.length) {
+    formData.append("detections", JSON.stringify(detections));
+  }
+
   const response = await fetch(`/sessions/${sessionId}/segments/upload`, {
     method: "POST",
     body: formData,
@@ -516,6 +551,370 @@ function startPolling() {
       console.error("Polling update failed", error);
     });
   }, 10000);
+}
+
+async function ensureInferenceRuntime() {
+  if (inferenceState.runtimeReady) {
+    return;
+  }
+  if (inferenceState.loading) {
+    // Wait for another caller to finish loading.
+    while (inferenceState.loading) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return;
+  }
+
+  inferenceState.loading = true;
+  try {
+    // Load full TensorFlow.js bundle (includes CPU backend)
+    if (!window.tf) {
+      const tfUrls = [
+        "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js",
+        "https://unpkg.com/@tensorflow/tfjs@4.20.0/dist/tf.min.js",
+      ];
+      await loadScriptWithFallback(tfUrls);
+    }
+
+    if (window.tf?.setBackend) {
+      await window.tf.setBackend("cpu");
+      await window.tf.ready();
+    }
+
+    // Load TFLite plugin from self-hosted assets to avoid CDN missing WASM glue.
+    if (!window.tflite) {
+      const base = inferenceState.wasmBaseUrl;
+      await loadScriptWithFallback([`${base}/tf-tflite.min.js`]);
+      await loadScriptWithFallback([`${base}/tflite_web_api_cc_simd.js`]);
+      if (window.tflite && window.tflite.setWasmPath) {
+        window.tflite.setWasmPath(`${base}/`);
+      }
+    }
+
+    if (!inferenceState.classMap.length) {
+      inferenceState.classMap = await loadClassMap();
+    }
+
+    inferenceState.runtimeReady = Boolean(window.tf && window.tflite);
+    if (!inferenceState.runtimeReady) {
+      throw new Error("Inference runtime failed to initialize. TF: " + Boolean(window.tf) + ", TFLite: " + Boolean(window.tflite));
+    }
+  } finally {
+    inferenceState.loading = false;
+  }
+}
+
+async function loadAudioModel() {
+  if (inferenceState.audioModel) {
+    return inferenceState.audioModel;
+  }
+  if (!inferenceState.runtimeReady || !window.tflite) {
+    throw new Error("Inference runtime not ready");
+  }
+  if (!inferenceState.audioModelUrl) {
+    throw new Error("Audio model URL not configured");
+  }
+
+  try {
+    // Load TFLite model from URL with options
+    inferenceState.audioModel = await window.tflite.loadTFLiteModel(
+      inferenceState.audioModelUrl,
+      {
+        numThreads: Math.max(navigator.hardwareConcurrency / 2 || 1, 1),
+      }
+    );
+    return inferenceState.audioModel;
+  } catch (error) {
+    console.error("Failed to load audio model from URL", error);
+    // Fallback: try loading from cache
+    try {
+      const buffer = await fetchModelFromCache(inferenceState.audioModelUrl);
+      inferenceState.audioModel = await window.tflite.loadTFLiteModel(buffer, {
+        numThreads: Math.max(navigator.hardwareConcurrency / 2 || 1, 1),
+      });
+      return inferenceState.audioModel;
+    } catch (fallbackError) {
+      console.error("Failed to load audio model from cache", fallbackError);
+      throw error;
+    }
+  }
+}
+
+function downsampleToMono(audioBuffer, targetRate = 16000) {
+  const channelData = audioBuffer.getChannelData(0);
+  if (audioBuffer.sampleRate === targetRate) {
+    return channelData;
+  }
+  const ratio = audioBuffer.sampleRate / targetRate;
+  const newLength = Math.floor(channelData.length / ratio);
+  const result = new Float32Array(newLength);
+  for (let i = 0; i < newLength; i++) {
+    result[i] = channelData[Math.floor(i * ratio)];
+  }
+  return result;
+}
+
+async function runAudioInference(blob, endTs) {
+  try {
+    const model = await loadAudioModel();
+    const arrayBuffer = await blob.arrayBuffer();
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const decoded = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+    const mono = downsampleToMono(decoded, 16000);
+
+    const start = performance.now();
+    // Compute log-mel spectrogram patches
+    const waveform = window.tf.tensor1d(mono);
+    const frameLength = 400; // 25ms
+    const frameStep = 160; // 10ms
+    const fftLength = 512;
+    const numMelBins = 64;
+    const patchFrames = 96; // ~0.96s
+    const patchHop = 48; // ~0.48s
+    const lowerEdgeHz = 125;
+    const upperEdgeHz = 7500;
+
+    const stft = window.tf.signal.stft(
+      waveform,
+      frameLength,
+      frameStep,
+      fftLength,
+      () => window.tf.signal.hannWindow(frameLength)
+    );
+    const magnitude = window.tf.abs(stft);
+    const powerSpec = window.tf.square(magnitude);
+    const melMatrix = buildMelFilterbank(
+      numMelBins,
+      fftLength / 2 + 1,
+      16000,
+      lowerEdgeHz,
+      upperEdgeHz
+    );
+    const melSpec = window.tf.matMul(powerSpec, melMatrix, false, true);
+    const logMelSpec = window.tf.log(melSpec.add(1e-6));
+
+    // Frame into patches; pad time axis if needed to meet patchFrames length.
+    const timeSteps = logMelSpec.shape[0] || 0;
+    const padFrames = Math.max(patchFrames - timeSteps, 0);
+    let framedInput = logMelSpec;
+    let disposeFramedInput = false;
+    if (padFrames > 0) {
+      framedInput = window.tf.pad(logMelSpec, [
+        [0, padFrames],
+        [0, 0],
+      ]);
+      disposeFramedInput = true;
+    }
+
+    const safeHop = Math.max(patchHop, 1);
+    const slices = [];
+    for (let start = 0; start + patchFrames <= framedInput.shape[0]; start += safeHop) {
+      slices.push(framedInput.slice([start, 0], [patchFrames, numMelBins]));
+    }
+    if (!slices.length) {
+      if (disposeFramedInput) {
+        framedInput.dispose();
+      }
+      waveform.dispose();
+      stft.dispose();
+      magnitude.dispose();
+      powerSpec.dispose();
+      melMatrix.dispose();
+      melSpec.dispose();
+      logMelSpec.dispose();
+      return [];
+    }
+
+    const patches = window.tf.stack(slices); // [numPatches, patchFrames, numMelBins]
+    const numPatches = patches.shape[0];
+    // YamNet expects batch=1; average patches to a single patch.
+    const mergedPatch = patches.mean(0); // [patchFrames, numMelBins]
+    const inputTensor = mergedPatch.reshape([1, 1, patchFrames, numMelBins]);
+
+    let output;
+    try {
+      output = model.predict(inputTensor);
+    } finally {
+      inputTensor.dispose();
+      waveform.dispose();
+      stft.dispose();
+      magnitude.dispose();
+      powerSpec.dispose();
+      melMatrix.dispose();
+      melSpec.dispose();
+      logMelSpec.dispose();
+      if (disposeFramedInput) {
+        framedInput.dispose();
+      }
+      patches.dispose();
+      mergedPatch.dispose();
+      slices.forEach((s) => s.dispose());
+    }
+
+    const logits = await output.data();
+    if (output.dispose) {
+      output.dispose();
+    }
+    if (!logits || logits.length === 0) {
+      return [];
+    }
+
+    // Average logits across patches, then softmax
+    const numClasses = logits.length / numPatches;
+    const classTotals = new Float32Array(numClasses);
+    for (let i = 0; i < logits.length; i++) {
+      classTotals[i % numClasses] += logits[i];
+    }
+    const avgLogits = Array.from(classTotals).map((v) => v / numPatches);
+    const { maxIdx, maxProb } = softmaxTop1(avgLogits);
+
+    const latencyMs = Math.max(Math.round(performance.now() - start), 1);
+    const confidence = Math.max(Math.min(maxProb, 1), 0);
+    const label =
+      inferenceState.classMap[maxIdx] ||
+      `audio_class_${maxIdx}`;
+
+    return [
+      {
+        class: label,
+        confidence,
+        timestamp: endTs.toISOString(),
+        model_id: inferenceState.audioModelId,
+        inference_latency_ms: latencyMs,
+        origin: "client",
+      },
+    ];
+  } catch (error) {
+    console.error("Audio inference failed", error);
+    return [];
+  }
+}
+
+async function fetchModelFromCache(url) {
+  if (window.caches) {
+    const cache = await caches.open("buurt-models");
+    const cached = await cache.match(url);
+    if (cached) {
+      return cached.arrayBuffer();
+    }
+    const response = await fetch(url, { cache: "force-cache" });
+    await cache.put(url, response.clone());
+    return response.arrayBuffer();
+  }
+  const response = await fetch(url, { cache: "force-cache" });
+  return response.arrayBuffer();
+}
+
+async function loadScriptWithFallback(urls) {
+  for (const url of urls) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((resolve, reject) => {
+        const script = document.createElement("script");
+        script.src = url;
+        script.onload = () => resolve();
+        script.onerror = () => reject(new Error(`Failed to load ${url}`));
+        document.head.append(script);
+      });
+      return;
+    } catch (error) {
+      console.warn("Script load failed, trying next URL", url, error);
+    }
+  }
+  throw new Error("All script sources failed to load");
+}
+
+function softmaxTop1(values) {
+  let maxLogit = -Infinity;
+  for (let i = 0; i < values.length; i++) {
+    if (values[i] > maxLogit) {
+      maxLogit = values[i];
+    }
+  }
+  let sumExp = 0;
+  let maxIdx = 0;
+  let maxProb = 0;
+  for (let i = 0; i < values.length; i++) {
+    const expVal = Math.exp(values[i] - maxLogit);
+    sumExp += expVal;
+    if (expVal > maxProb) {
+      maxProb = expVal;
+      maxIdx = i;
+    }
+  }
+  if (sumExp > 0) {
+    maxProb /= sumExp;
+  }
+  return { maxIdx, maxProb };
+}
+
+async function loadClassMap() {
+  try {
+    const response = await fetch(inferenceState.classMapUrl, { cache: "force-cache" });
+    if (!response.ok) {
+      throw new Error(`Failed to fetch class map: ${response.statusText}`);
+    }
+    const text = await response.text();
+    const lines = text.trim().split("\n");
+    const headers = lines.shift(); // drop header
+    const labels = [];
+    for (const line of lines) {
+      const parts = line.split(",");
+      // CSV format: index,mid,display_name
+      if (parts.length >= 3) {
+        labels.push(parts[2].replace(/(^\"|\"$)/g, ""));
+      }
+    }
+    return labels;
+  } catch (error) {
+    console.warn("Failed to load class map", error);
+    return [];
+  }
+}
+
+function buildMelFilterbank(
+  numMelBins,
+  numSpectrogramBins,
+  sampleRate,
+  lowerEdgeHz,
+  upperEdgeHz,
+) {
+  const hzToMel = (hz) => 1127 * Math.log(1 + hz / 700);
+  const melToHz = (mel) => 700 * (Math.exp(mel / 1127) - 1);
+
+  const lowerMel = hzToMel(lowerEdgeHz);
+  const upperMel = hzToMel(upperEdgeHz);
+  const melPoints = new Float32Array(numMelBins + 2);
+  for (let i = 0; i < melPoints.length; i++) {
+    melPoints[i] = lowerMel + ((upperMel - lowerMel) * i) / (numMelBins + 1);
+  }
+  const hzPoints = melPoints.map(melToHz);
+  const binFrequencies = new Float32Array(numSpectrogramBins);
+  const linearFreqs = (sampleRate / 2) / (numSpectrogramBins - 1);
+  for (let i = 0; i < numSpectrogramBins; i++) {
+    binFrequencies[i] = i * linearFreqs;
+  }
+
+  const filterbank = [];
+  for (let m = 0; m < numMelBins; m++) {
+    const lower = hzPoints[m];
+    const center = hzPoints[m + 1];
+    const upper = hzPoints[m + 2];
+    const weights = new Float32Array(numSpectrogramBins);
+    for (let k = 0; k < numSpectrogramBins; k++) {
+      const freq = binFrequencies[k];
+      let w = 0;
+      if (freq >= lower && freq <= center) {
+        w = (freq - lower) / (center - lower + 1e-8);
+      } else if (freq > center && freq <= upper) {
+        w = (upper - freq) / (upper - center + 1e-8);
+      }
+      weights[k] = w;
+    }
+    filterbank.push(weights);
+  }
+
+  return window.tf.tensor2d(filterbank, [numMelBins, numSpectrogramBins]);
 }
 
 function stopLongPolling() {

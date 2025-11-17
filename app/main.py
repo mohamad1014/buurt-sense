@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import aclosing, asynccontextmanager
 from datetime import datetime
+import json
 from hashlib import blake2s
 from pathlib import Path
 from typing import Any
@@ -142,6 +143,7 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
         start_ts: datetime = Form(...),
         end_ts: datetime = Form(...),
         file: UploadFile = File(...),
+        detections: str | None = Form(default=None),
     ) -> dict[str, Any]:
         """Store an uploaded media segment on disk and persist its metadata."""
 
@@ -176,6 +178,29 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
         )
         try:
             segment = await store.create_segment(session_id, payload)
+            persisted_detections: list[dict[str, Any]] = []
+            if detections:
+                try:
+                    parsed = json.loads(detections)
+                    if not isinstance(parsed, list):
+                        raise ValueError("detections must be a JSON array")
+                    for item in parsed:
+                        validator = getattr(DetectionCreate, "model_validate", None)
+                        if callable(validator):
+                            detection_payload = validator(item)
+                        else:
+                            detection_payload = DetectionCreate.parse_obj(item)
+                        persisted = await store.create_detection(
+                            segment["id"], detection_payload
+                        )
+                        persisted_detections.append(persisted)
+                except Exception as exc:
+                    # Roll back the segment write if detection payload is malformed.
+                    destination.unlink(missing_ok=True)
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Invalid detections payload: {exc}",
+                    ) from exc
         except SessionNotFoundError as exc:
             destination.unlink(missing_ok=True)
             raise HTTPException(
@@ -189,7 +214,10 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
                 detail=str(exc),
             ) from exc
 
-        return jsonable_encoder(segment)
+        response = jsonable_encoder(segment)
+        if detections:
+            response["detections"] = persisted_detections
+        return response
 
     @app.post("/segments/{segment_id}/detections", status_code=status.HTTP_201_CREATED)
     async def create_detection(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -460,6 +461,15 @@ def test_segment_upload_endpoint_writes_media_file(
             "index": "0",
             "start_ts": start_ts.isoformat(),
             "end_ts": end_ts.isoformat(),
+            "detections": json.dumps(
+                [
+                    {
+                        "class": "gunshot",
+                        "confidence": 0.91,
+                        "timestamp": end_ts.isoformat(),
+                    }
+                ]
+            ),
         },
         files={"file": ("segment.webm", blob, "audio/webm")},
     )
@@ -467,6 +477,9 @@ def test_segment_upload_endpoint_writes_media_file(
     payload = response.json()
     assert payload["size_bytes"] == len(blob)
     assert payload["audio_duration_ms"] >= 2000
+    assert "detections" in payload
+    assert payload["detections"][0]["confidence"] == 0.91
+    assert payload["detections"][0]["label"] == "gunshot"
 
     capture_root = Path(os.environ["BUURT_CAPTURE_ROOT"])
     stored_path = capture_root / payload["file_path"]
@@ -483,6 +496,19 @@ def _assert_timezone(value: str) -> datetime:
     dt = datetime.fromisoformat(value)
     assert dt.tzinfo is not None, "datetime values must include timezone information"
     return dt
+
+
+def test_health_reports_inference_status(client: TestClient) -> None:
+    """Health endpoint should expose inference status and counters."""
+
+    response = client.get("/health")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload.get("status") == "ok"
+    inference = payload.get("inference", {})
+    assert isinstance(inference, dict)
+    assert "counters" in inference
+    assert "audio" in inference and "video" in inference
 
 
 def test_session_detail_endpoint_returns_expected_payload(

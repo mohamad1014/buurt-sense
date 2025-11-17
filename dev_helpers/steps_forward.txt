@@ -4,6 +4,8 @@ Wire up real inference instead of the ambient-noise stub by adding a FastAPI inf
 ✅ Integrated inference into the capture backend with per-session config overrides and cooldown state.
 ✅ Surfaced inference stats in /health; env toggles for audio/video and thresholds (`BUURT_ENABLE_AUDIO_INFER`, `BUURT_ENABLE_VIDEO_INFER`, `BUURT_INFER_THRESHOLD`, `BUURT_CLASS_COOLDOWN_SEC`, `BUURT_AUDIO_MODEL_ID`, `BUURT_VIDEO_MODEL_ID`).
 ➡️ Next: swap stub detectors for real YAMNet/YOLO runners; add model readiness to health and update README with model paths and usage guidance.
+
+🆕 Client-provided detections are now accepted on `/segments/upload` via a `detections` JSON array, enabling phone-side inference to be attached to uploads. Frontend has a stub hook (`getMobileDetections`) to wire TF.js/WASM.
 Expand the browser client beyond the fixed defaults to expose controls for segment length/overlap/confidence and show live detection overlays + recording indicator; current payload is hard-coded in app/frontend/static/app.js (lines 200-217) and there’s no UI for configuration (README.md (lines 140-214)).
 Add offline/PWA ergonomics: ensure MediaRecorder uploads queue/retry, persist metadata locally (IndexedDB) before POSTing, and prep for background capture/session resumes (README.md (lines 172-215)).
 Introduce a pluggable storage layer so cloud/object storage backends can replace local disk/SQLite without touching route handlers (README.md (lines 259-263)).

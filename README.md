@@ -330,6 +330,9 @@ http GET :8000/sessions/{session_id}
 curl -X GET http://localhost:8000/sessions/{session_id}
 ```
 
+#### Upload a Recorded Segment with Client Detections (`POST /sessions/{session_id}/segments/upload`)
+- Fields: `index`, `start_ts`, `end_ts`, `file` (multipart), optional `detections` JSON array shaped like `{"class": "gunshot", "confidence": 0.9, "timestamp": "<iso8601>"}` produced by on-device inference (e.g., TF.js/WASM). When provided, the backend persists those detections and skips its synthetic inference for that segment.
+
 ## 17. Development Tasks (Next)
 - Implement Python FastAPI inference service skeleton.
 - Integrate React PWA media capture (video+audio) + segmentation (30s w/5s overlap).
