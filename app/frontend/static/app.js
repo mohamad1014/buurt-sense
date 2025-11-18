@@ -26,14 +26,25 @@ const inferenceState = {
     window.BUURT_AUDIO_MODEL_URL || "/static/tflite/YamNet_float.tflite",
   videoModelUrl:
     window.BUURT_VIDEO_MODEL_URL ||
-    "https://huggingface.co/qualcomm/Yolo-X/resolve/main/Yolo-X_float.tflite?download=true",
+    "https://huggingface.co/qualcomm/ResNet-Mixed-Convolution/resolve/main/ResNet-Mixed-Convolution_float.tflite?download=true",
   audioModelId: "yamnet-client-tfjs",
-  videoModelId: "yolox-client-tfjs",
+  videoModelId: "resnet-mc-client-tflite",
   wasmBaseUrl: "/static/tflite",
   classMap: [],
   classMapUrl:
     window.BUURT_YAMNET_CLASS_MAP_URL ||
     "https://raw.githubusercontent.com/tensorflow/models/master/research/audioset/yamnet/yamnet_class_map.csv",
+  videoClassMap: [],
+  videoClassMapUrl:
+    window.BUURT_VIDEO_CLASS_MAP_URL ||
+    "/static/labels/kinetics400_label_map.txt",
+  videoFrameCount: 16,
+  videoInputSize: 112,
+};
+
+const kineticsNormalization = {
+  mean: [0.43216, 0.394666, 0.37645],
+  std: [0.22803, 0.22145, 0.216989],
 };
 
 function formatTimestamp(timestamp) {
@@ -154,8 +165,15 @@ async function fetchJson(url, options) {
 async function getMobileDetections(blob, startTs, endTs, index) {
   try {
     await ensureInferenceRuntime();
-    const audioDetections = await runAudioInference(blob, endTs);
-    return audioDetections;
+    const hasVideo = typeof blob.type === "string" && blob.type.startsWith("video/");
+    const [audioDetections, videoDetections] = await Promise.all([
+      runAudioInference(blob, endTs),
+      hasVideo ? runVideoInference(blob, startTs, endTs) : Promise.resolve([]),
+    ]);
+    if (!hasVideo) {
+      console.info("Skipping video inference: blob is not a video", { mime: blob.type });
+    }
+    return [...(audioDetections || []), ...(videoDetections || [])];
   } catch (error) {
     console.warn("Mobile inference unavailable, skipping detections", error);
     return [];
@@ -594,6 +612,9 @@ async function ensureInferenceRuntime() {
     if (!inferenceState.classMap.length) {
       inferenceState.classMap = await loadClassMap();
     }
+    if (!inferenceState.videoClassMap.length) {
+      inferenceState.videoClassMap = await loadVideoClassMap();
+    }
 
     inferenceState.runtimeReady = Boolean(window.tf && window.tflite);
     if (!inferenceState.runtimeReady) {
@@ -635,6 +656,39 @@ async function loadAudioModel() {
       return inferenceState.audioModel;
     } catch (fallbackError) {
       console.error("Failed to load audio model from cache", fallbackError);
+      throw error;
+    }
+  }
+}
+
+async function loadVideoModel() {
+  if (inferenceState.videoModel) {
+    return inferenceState.videoModel;
+  }
+  if (!inferenceState.runtimeReady || !window.tflite) {
+    throw new Error("Inference runtime not ready");
+  }
+  if (!inferenceState.videoModelUrl) {
+    throw new Error("Video model URL not configured");
+  }
+
+  const threads = Math.max(navigator.hardwareConcurrency / 2 || 1, 1);
+  try {
+    inferenceState.videoModel = await window.tflite.loadTFLiteModel(
+      inferenceState.videoModelUrl,
+      { numThreads: threads }
+    );
+    return inferenceState.videoModel;
+  } catch (error) {
+    console.error("Failed to load video model from URL", error);
+    try {
+      const buffer = await fetchModelFromCache(inferenceState.videoModelUrl);
+      inferenceState.videoModel = await window.tflite.loadTFLiteModel(buffer, {
+        numThreads: threads,
+      });
+      return inferenceState.videoModel;
+    } catch (fallbackError) {
+      console.error("Failed to load video model from cache", fallbackError);
       throw error;
     }
   }
@@ -790,6 +844,255 @@ async function runAudioInference(blob, endTs) {
   }
 }
 
+async function runVideoInference(blob, startTs, endTs) {
+  try {
+    const model = await loadVideoModel();
+    const frameCount = Math.max(inferenceState.videoFrameCount, 1);
+    const inputSize = Math.max(inferenceState.videoInputSize, 1);
+    const fallbackDurationSec = Math.max(
+      (endTs.getTime() - startTs.getTime()) / 1000,
+      0.001,
+    );
+    const frames = await sampleVideoFrames(
+      blob,
+      frameCount,
+      inputSize,
+      fallbackDurationSec,
+    );
+    if (!frames || !frames.data || !frames.frameCount) {
+      return [];
+    }
+
+    const inputTensor = window.tf.tensor(
+      frames.data,
+      [1, frameCount, inputSize, inputSize, 3],
+      "float32",
+    );
+
+    const start = performance.now();
+    let output;
+    try {
+      output = model.predict(inputTensor);
+    } finally {
+      inputTensor.dispose();
+    }
+
+    let logits;
+    if (output?.dataSync) {
+      logits = output.dataSync();
+    } else if (output?.data) {
+      logits = await output.data();
+    } else if (ArrayBuffer.isView(output)) {
+      logits = output;
+    } else if (Array.isArray(output)) {
+      logits = output;
+    } else if (output == null) {
+      console.warn("Video inference returned no output tensor");
+      return [];
+    } else {
+      console.warn("Video inference returned unexpected output", output);
+      return [];
+    }
+    if (output?.dispose) {
+      output.dispose();
+    }
+    if (!logits || logits.length === 0) {
+      console.warn("Video inference produced empty logits");
+      return [];
+    }
+
+    const { maxIdx, maxProb } = softmaxTop1(Array.from(logits));
+    const label =
+      inferenceState.videoClassMap[maxIdx] ||
+      `video_class_${maxIdx}`;
+
+    const latencyMs = Math.max(Math.round(performance.now() - start), 1);
+    const confidence = Math.max(Math.min(maxProb, 1), 0);
+
+    return [
+      {
+        class: label,
+        confidence,
+        timestamp: endTs.toISOString(),
+        model_id: inferenceState.videoModelId,
+        inference_latency_ms: latencyMs,
+        origin: "client",
+      },
+    ];
+  } catch (error) {
+    console.error("Video inference failed", error);
+    return [];
+  }
+}
+
+async function sampleVideoFrames(blob, frameCount, targetSize, fallbackDurationSec = 0) {
+  if (typeof document === "undefined") {
+    return null;
+  }
+  const url = URL.createObjectURL(blob);
+  const video = document.createElement("video");
+  video.muted = true;
+  video.preload = "auto";
+  video.playsInline = true;
+  video.crossOrigin = "anonymous";
+  video.src = url;
+  if (video.load) {
+    video.load();
+  }
+
+  try {
+    await new Promise((resolve, reject) => {
+      const onMetadata = () => resolve();
+      const onError = (event) =>
+        reject(
+          new Error(event?.message || "Unable to decode video for inference"),
+        );
+      video.addEventListener("loadedmetadata", onMetadata, { once: true });
+      video.addEventListener("error", onError, { once: true });
+    });
+
+    if (
+      !video.videoWidth ||
+      !video.videoHeight ||
+      video.videoWidth <= 0 ||
+      video.videoHeight <= 0
+    ) {
+      console.warn("Video metadata missing width/height/duration; skipping video inference", {
+        width: video.videoWidth,
+        height: video.videoHeight,
+        duration: video.duration,
+      });
+      return null;
+    }
+
+    const rawDuration = Number.isFinite(video.duration) ? video.duration : fallbackDurationSec;
+    const safeDuration = Math.max(rawDuration, fallbackDurationSec, 0.001);
+    const canvas =
+      typeof OffscreenCanvas !== "undefined"
+        ? new OffscreenCanvas(targetSize, targetSize)
+        : (() => {
+            const element = document.createElement("canvas");
+            element.width = targetSize;
+            element.height = targetSize;
+            return element;
+          })();
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) {
+      return null;
+    }
+    if (ctx.canvas) {
+      ctx.canvas.width = targetSize;
+      ctx.canvas.height = targetSize;
+    }
+
+    const frames = new Float32Array(frameCount * targetSize * targetSize * 3);
+    const step = safeDuration / frameCount;
+    const sampleTimes = [];
+    for (let i = 0; i < frameCount; i++) {
+      const midpoint = step * (i + 0.5);
+      const clamped = Math.min(
+        Math.max(midpoint, 0),
+        Math.max(safeDuration - 0.001, 0),
+      );
+      sampleTimes.push(clamped);
+    }
+
+    for (let i = 0; i < sampleTimes.length; i++) {
+      try {
+        await seekVideo(video, sampleTimes[i]);
+      } catch (error) {
+        console.warn("Video seek failed; continuing with previous frame", error);
+      }
+      drawVideoFrame(ctx, video, targetSize);
+      const pixels = ctx.getImageData(0, 0, targetSize, targetSize).data;
+      const offset = i * targetSize * targetSize * 3;
+      normalizeFrame(pixels, frames, offset);
+    }
+
+    return { data: frames, frameCount };
+  } finally {
+    URL.revokeObjectURL(url);
+    video.src = "";
+  }
+}
+
+function seekVideo(video, timeSec) {
+  return new Promise((resolve, reject) => {
+    const clamped = Math.min(
+      Math.max(timeSec, 0),
+      Math.max((video.duration || 0) - 0.001, 0),
+    );
+    const cleanup = () => {
+      video.removeEventListener("seeked", onSeeked);
+      video.removeEventListener("error", onError);
+    };
+    const onSeeked = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = (event) => {
+      cleanup();
+      reject(
+        event?.error || new Error("Video seek failed during preprocessing"),
+      );
+    };
+
+    if (
+      video.readyState >= (window.HTMLMediaElement?.HAVE_CURRENT_DATA || 2) &&
+      Math.abs(video.currentTime - clamped) < 0.01
+    ) {
+      cleanup();
+      resolve();
+      return;
+    }
+
+    video.addEventListener("seeked", onSeeked, { once: true });
+    video.addEventListener("error", onError, { once: true });
+    try {
+      video.currentTime = clamped;
+    } catch (error) {
+      cleanup();
+      reject(error);
+    }
+  });
+}
+
+function drawVideoFrame(ctx, video, targetSize) {
+  const videoWidth = video.videoWidth || targetSize;
+  const videoHeight = video.videoHeight || targetSize;
+  const videoRatio = videoWidth / videoHeight;
+  let sx = 0;
+  let sy = 0;
+  let sw = videoWidth;
+  let sh = videoHeight;
+
+  if (videoRatio > 1) {
+    sh = videoHeight;
+    sw = sh;
+    sx = (videoWidth - sw) / 2;
+  } else if (videoRatio < 1) {
+    sw = videoWidth;
+    sh = sw;
+    sy = (videoHeight - sh) / 2;
+  }
+
+  ctx.drawImage(video, sx, sy, sw, sh, 0, 0, targetSize, targetSize);
+}
+
+function normalizeFrame(pixels, target, offset) {
+  const mean = kineticsNormalization.mean;
+  const std = kineticsNormalization.std;
+  let writeIndex = offset;
+  for (let i = 0; i < pixels.length; i += 4) {
+    const r = pixels[i] / 255;
+    const g = pixels[i + 1] / 255;
+    const b = pixels[i + 2] / 255;
+    target[writeIndex++] = (r - mean[0]) / std[0];
+    target[writeIndex++] = (g - mean[1]) / std[1];
+    target[writeIndex++] = (b - mean[2]) / std[2];
+  }
+}
+
 async function fetchModelFromCache(url) {
   if (window.caches) {
     const cache = await caches.open("buurt-models");
@@ -855,19 +1158,39 @@ async function loadClassMap() {
       throw new Error(`Failed to fetch class map: ${response.statusText}`);
     }
     const text = await response.text();
-    const lines = text.trim().split("\n");
+    const lines = text
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
     const headers = lines.shift(); // drop header
     const labels = [];
     for (const line of lines) {
-      const parts = line.split(",");
+      const parts = line.trim().split(",");
       // CSV format: index,mid,display_name
       if (parts.length >= 3) {
-        labels.push(parts[2].replace(/(^\"|\"$)/g, ""));
+        labels.push(parts[2].replace(/(^\"|\"$)/g, "").trim());
       }
     }
     return labels;
   } catch (error) {
     console.warn("Failed to load class map", error);
+    return [];
+  }
+}
+
+async function loadVideoClassMap() {
+  try {
+    const response = await fetch(inferenceState.videoClassMapUrl, { cache: "force-cache" });
+    if (!response.ok) {
+      throw new Error(`Failed to fetch video class map: ${response.statusText}`);
+    }
+    const text = await response.text();
+    return text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+  } catch (error) {
+    console.warn("Failed to load video class map", error);
     return [];
   }
 }
