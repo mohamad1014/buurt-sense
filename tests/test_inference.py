@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import sys
+import types
 from uuid import uuid4
 
 from app.inference import (
@@ -96,3 +98,79 @@ def test_status_exposes_readiness() -> None:
     assert isinstance(status["audio"].get("enabled"), bool)
     assert "ready" in status["audio"]
     assert "model_id" in status["audio"]
+
+
+def _install_fake_tflite(monkeypatch, invoked_flag: dict[str, bool]) -> None:
+    """Register a fake tflite_runtime Interpeter to avoid the real dependency."""
+
+    class FakeInterpreter:
+        def __init__(self, *args, **kwargs):
+            invoked_flag["constructed"] = True
+
+        def allocate_tensors(self):
+            invoked_flag["allocated"] = True
+
+        def invoke(self):
+            invoked_flag["invoked"] = True
+
+    fake_interpreter_module = types.SimpleNamespace(Interpreter=FakeInterpreter)
+    fake_runtime = types.ModuleType("tflite_runtime")
+    fake_runtime.interpreter = fake_interpreter_module
+    monkeypatch.setitem(sys.modules, "tflite_runtime", fake_runtime)
+    monkeypatch.setitem(sys.modules, "tflite_runtime.interpreter", fake_interpreter_module)
+
+
+def test_audio_detector_invokes_tflite_when_available(monkeypatch, tmp_path) -> None:
+    """Audio detector should load and invoke the TFLite interpreter when present."""
+
+    invoked: dict[str, bool] = {}
+    _install_fake_tflite(monkeypatch, invoked)
+
+    dummy_model = tmp_path / "yamnet.tflite"
+    dummy_model.write_bytes(b"fake")
+
+    config = InferenceConfig(
+        audio_model_path=dummy_model,
+        video_model_path=None,
+        enable_audio=True,
+        enable_video=False,
+    )
+    engine = InferenceEngine(config)
+    request = _make_request(tmp_path)
+
+    detections = engine.detect(request)
+
+    assert detections, "audio detector should emit a detection when model loads"
+    assert invoked.get("constructed") and invoked.get("allocated")
+    assert invoked.get("invoked")
+    status = engine.status()["audio"]
+    assert status["ready"] is True
+    assert status["last_error"] is None
+
+
+def test_video_detector_invokes_tflite_when_available(monkeypatch, tmp_path) -> None:
+    """Video detector should load and invoke the TFLite interpreter when present."""
+
+    invoked: dict[str, bool] = {}
+    _install_fake_tflite(monkeypatch, invoked)
+
+    dummy_model = tmp_path / "yolo.tflite"
+    dummy_model.write_bytes(b"fake")
+
+    config = InferenceConfig(
+        video_model_path=dummy_model,
+        audio_model_path=None,
+        enable_audio=False,
+        enable_video=True,
+    )
+    engine = InferenceEngine(config)
+    request = _make_request(tmp_path, frame_count=32)
+
+    detections = engine.detect(request)
+
+    assert detections, "video detector should emit a detection when model loads"
+    assert invoked.get("constructed") and invoked.get("allocated")
+    assert invoked.get("invoked")
+    status = engine.status()["video"]
+    assert status["ready"] is True
+    assert status["last_error"] is None
