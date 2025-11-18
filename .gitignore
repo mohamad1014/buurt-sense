@@ -219,3 +219,4 @@ models/
 
 # Node
 node_modules/
+test-results/.last-run.json

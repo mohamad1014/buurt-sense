@@ -9,5 +9,11 @@ export default defineConfig({
   use: {
     headless: true,
     viewport: { width: 1280, height: 720 },
+    launchOptions: {
+      args: [
+        "--enable-features=SharedArrayBuffer",
+        "--js-flags=--experimental-wasm-simd",
+      ],
+    },
   },
 });
