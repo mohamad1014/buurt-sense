@@ -350,6 +350,17 @@ curl -X GET http://localhost:8000/sessions/{session_id}
 - Model sanity: sample clips produce expected class probabilities.
 - Future: confusion matrix generation, performance benchmarks on low-end devices.
 
+### Frontend model integration tests (optional/heavy)
+These tests run the browser-side TFLite models (YamNet + ResNet-Mixed-Convolution) via Playwright. They download the full models and are skipped unless explicitly enabled.
+
+```bash
+# install JS test deps
+npm install
+
+# run expensive model checks (downloads models; needs network)
+RUN_MODEL_TESTS=1 npm run test:frontend
+```
+
 ### Running Tests
 
 ```bash

@@ -216,3 +216,6 @@ recordings/
 
 # models
 models/
+
+# Node
+node_modules/
