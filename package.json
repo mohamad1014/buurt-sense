@@ -1,0 +1,11 @@
+{
+  "name": "buurt-sense-frontend-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:frontend": "npx playwright test frontend-tests"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.2"
+  }
+}

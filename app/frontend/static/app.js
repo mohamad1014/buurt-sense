@@ -17,6 +17,36 @@ const captureState = {
   orientationPermissionRequested: false,
 };
 
+const inferenceState = {
+  audioModel: null,
+  videoModel: null,
+  runtimeReady: false,
+  loading: false,
+  audioModelUrl:
+    window.BUURT_AUDIO_MODEL_URL || "/static/tflite/YamNet_float.tflite",
+  videoModelUrl:
+    window.BUURT_VIDEO_MODEL_URL ||
+    "https://huggingface.co/qualcomm/ResNet-Mixed-Convolution/resolve/main/ResNet-Mixed-Convolution_float.tflite?download=true",
+  audioModelId: "yamnet-client-tfjs",
+  videoModelId: "resnet-mc-client-tflite",
+  wasmBaseUrl: "/static/tflite",
+  classMap: [],
+  classMapUrl:
+    window.BUURT_YAMNET_CLASS_MAP_URL ||
+    "https://raw.githubusercontent.com/tensorflow/models/master/research/audioset/yamnet/yamnet_class_map.csv",
+  videoClassMap: [],
+  videoClassMapUrl:
+    window.BUURT_VIDEO_CLASS_MAP_URL ||
+    "/static/labels/kinetics400_label_map.txt",
+  videoFrameCount: 16,
+  videoInputSize: 112,
+};
+
+const kineticsNormalization = {
+  mean: [0.43216, 0.394666, 0.37645],
+  std: [0.22803, 0.22145, 0.216989],
+};
+
 function formatTimestamp(timestamp) {
   if (!timestamp) {
     return "--";
@@ -132,6 +162,24 @@ async function fetchJson(url, options) {
   return response.json();
 }
 
+async function getMobileDetections(blob, startTs, endTs, index) {
+  try {
+    await ensureInferenceRuntime();
+    const hasVideo = typeof blob.type === "string" && blob.type.startsWith("video/");
+    const [audioDetections, videoDetections] = await Promise.all([
+      runAudioInference(blob, endTs),
+      hasVideo ? runVideoInference(blob, startTs, endTs) : Promise.resolve([]),
+    ]);
+    if (!hasVideo) {
+      console.info("Skipping video inference: blob is not a video", { mime: blob.type });
+    }
+    return [...(audioDetections || []), ...(videoDetections || [])];
+  } catch (error) {
+    console.warn("Mobile inference unavailable, skipping detections", error);
+    return [];
+  }
+}
+
 async function loadSessions(options = {}) {
   const announce = options.announce ?? true;
   try {
@@ -206,7 +254,7 @@ async function buildSessionPayload() {
     config_snapshot: {
       segment_length_sec: 30,
       overlap_sec: 5,
-      confidence_threshold: 0.6,
+      confidence_threshold: 0.1,
     },
     detection_summary: {
       total_detections: 0,
@@ -463,6 +511,11 @@ async function uploadSegmentBlob(sessionId, index, startTs, endTs, blob) {
     `segment-${String(index).padStart(4, "0")}.webm`,
   );
 
+  const detections = await getMobileDetections(blob, startTs, endTs, index);
+  if (detections && detections.length) {
+    formData.append("detections", JSON.stringify(detections));
+  }
+
   const response = await fetch(`/sessions/${sessionId}/segments/upload`, {
     method: "POST",
     body: formData,
@@ -516,6 +569,675 @@ function startPolling() {
       console.error("Polling update failed", error);
     });
   }, 10000);
+}
+
+async function ensureInferenceRuntime() {
+  if (inferenceState.runtimeReady) {
+    return;
+  }
+  if (inferenceState.loading) {
+    // Wait for another caller to finish loading.
+    while (inferenceState.loading) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return;
+  }
+
+  inferenceState.loading = true;
+  try {
+    // Load full TensorFlow.js bundle (includes CPU backend)
+    if (!window.tf) {
+      const tfUrls = [
+        "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js",
+        "https://unpkg.com/@tensorflow/tfjs@4.20.0/dist/tf.min.js",
+      ];
+      await loadScriptWithFallback(tfUrls);
+    }
+
+    if (window.tf?.setBackend) {
+      await window.tf.setBackend("cpu");
+      await window.tf.ready();
+    }
+
+    // Load TFLite plugin from self-hosted assets to avoid CDN missing WASM glue.
+    if (!window.tflite) {
+      const base = inferenceState.wasmBaseUrl;
+      await loadScriptWithFallback([`${base}/tf-tflite.min.js`]);
+      await loadScriptWithFallback([`${base}/tflite_web_api_cc_simd.js`]);
+      if (window.tflite && window.tflite.setWasmPath) {
+        window.tflite.setWasmPath(`${base}/`);
+      }
+    }
+
+    if (!inferenceState.classMap.length) {
+      inferenceState.classMap = await loadClassMap();
+    }
+    if (!inferenceState.videoClassMap.length) {
+      inferenceState.videoClassMap = await loadVideoClassMap();
+    }
+
+    inferenceState.runtimeReady = Boolean(window.tf && window.tflite);
+    if (!inferenceState.runtimeReady) {
+      throw new Error("Inference runtime failed to initialize. TF: " + Boolean(window.tf) + ", TFLite: " + Boolean(window.tflite));
+    }
+  } finally {
+    inferenceState.loading = false;
+  }
+}
+
+async function loadAudioModel() {
+  if (inferenceState.audioModel) {
+    return inferenceState.audioModel;
+  }
+  if (!inferenceState.runtimeReady || !window.tflite) {
+    throw new Error("Inference runtime not ready");
+  }
+  if (!inferenceState.audioModelUrl) {
+    throw new Error("Audio model URL not configured");
+  }
+
+  try {
+    // Load TFLite model from URL with options
+    inferenceState.audioModel = await window.tflite.loadTFLiteModel(
+      inferenceState.audioModelUrl,
+      {
+        numThreads: Math.max(navigator.hardwareConcurrency / 2 || 1, 1),
+      }
+    );
+    return inferenceState.audioModel;
+  } catch (error) {
+    console.error("Failed to load audio model from URL", error);
+    // Fallback: try loading from cache
+    try {
+      const buffer = await fetchModelFromCache(inferenceState.audioModelUrl);
+      inferenceState.audioModel = await window.tflite.loadTFLiteModel(buffer, {
+        numThreads: Math.max(navigator.hardwareConcurrency / 2 || 1, 1),
+      });
+      return inferenceState.audioModel;
+    } catch (fallbackError) {
+      console.error("Failed to load audio model from cache", fallbackError);
+      throw error;
+    }
+  }
+}
+
+async function loadVideoModel() {
+  if (inferenceState.videoModel) {
+    return inferenceState.videoModel;
+  }
+  if (!inferenceState.runtimeReady || !window.tflite) {
+    throw new Error("Inference runtime not ready");
+  }
+  if (!inferenceState.videoModelUrl) {
+    throw new Error("Video model URL not configured");
+  }
+
+  const threads = Math.max(navigator.hardwareConcurrency / 2 || 1, 1);
+  try {
+    inferenceState.videoModel = await window.tflite.loadTFLiteModel(
+      inferenceState.videoModelUrl,
+      { numThreads: threads }
+    );
+    return inferenceState.videoModel;
+  } catch (error) {
+    console.error("Failed to load video model from URL", error);
+    try {
+      const buffer = await fetchModelFromCache(inferenceState.videoModelUrl);
+      inferenceState.videoModel = await window.tflite.loadTFLiteModel(buffer, {
+        numThreads: threads,
+      });
+      return inferenceState.videoModel;
+    } catch (fallbackError) {
+      console.error("Failed to load video model from cache", fallbackError);
+      throw error;
+    }
+  }
+}
+
+function downsampleToMono(audioBuffer, targetRate = 16000) {
+  const channelData = audioBuffer.getChannelData(0);
+  if (audioBuffer.sampleRate === targetRate) {
+    return channelData;
+  }
+  const ratio = audioBuffer.sampleRate / targetRate;
+  const newLength = Math.floor(channelData.length / ratio);
+  const result = new Float32Array(newLength);
+  for (let i = 0; i < newLength; i++) {
+    result[i] = channelData[Math.floor(i * ratio)];
+  }
+  return result;
+}
+
+async function runAudioInference(blob, endTs) {
+  try {
+    const model = await loadAudioModel();
+    const arrayBuffer = await blob.arrayBuffer();
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const decoded = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+    const mono = downsampleToMono(decoded, 16000);
+
+    const start = performance.now();
+    // Compute log-mel spectrogram patches
+    const waveform = window.tf.tensor1d(mono);
+    const frameLength = 400; // 25ms
+    const frameStep = 160; // 10ms
+    const fftLength = 512;
+    const numMelBins = 64;
+    const patchFrames = 96; // ~0.96s
+    const patchHop = 48; // ~0.48s
+    const lowerEdgeHz = 125;
+    const upperEdgeHz = 7500;
+
+    const stft = window.tf.signal.stft(
+      waveform,
+      frameLength,
+      frameStep,
+      fftLength,
+      () => window.tf.signal.hannWindow(frameLength)
+    );
+    const magnitude = window.tf.abs(stft);
+    const powerSpec = window.tf.square(magnitude);
+    const melMatrix = buildMelFilterbank(
+      numMelBins,
+      fftLength / 2 + 1,
+      16000,
+      lowerEdgeHz,
+      upperEdgeHz
+    );
+    const melSpec = window.tf.matMul(powerSpec, melMatrix, false, true);
+    const logMelSpec = window.tf.log(melSpec.add(1e-6));
+
+    // Frame into patches; pad time axis if needed to meet patchFrames length.
+    const timeSteps = logMelSpec.shape[0] || 0;
+    const padFrames = Math.max(patchFrames - timeSteps, 0);
+    let framedInput = logMelSpec;
+    let disposeFramedInput = false;
+    if (padFrames > 0) {
+      framedInput = window.tf.pad(logMelSpec, [
+        [0, padFrames],
+        [0, 0],
+      ]);
+      disposeFramedInput = true;
+    }
+
+    const safeHop = Math.max(patchHop, 1);
+    const slices = [];
+    for (let start = 0; start + patchFrames <= framedInput.shape[0]; start += safeHop) {
+      slices.push(framedInput.slice([start, 0], [patchFrames, numMelBins]));
+    }
+    if (!slices.length) {
+      if (disposeFramedInput) {
+        framedInput.dispose();
+      }
+      waveform.dispose();
+      stft.dispose();
+      magnitude.dispose();
+      powerSpec.dispose();
+      melMatrix.dispose();
+      melSpec.dispose();
+      logMelSpec.dispose();
+      return [];
+    }
+
+    const patches = window.tf.stack(slices); // [numPatches, patchFrames, numMelBins]
+    const numPatches = patches.shape[0];
+    // YamNet expects batch=1; average patches to a single patch.
+    const mergedPatch = patches.mean(0); // [patchFrames, numMelBins]
+    const inputTensor = mergedPatch.reshape([1, 1, patchFrames, numMelBins]);
+
+    let output;
+    try {
+      output = model.predict(inputTensor);
+    } finally {
+      inputTensor.dispose();
+      waveform.dispose();
+      stft.dispose();
+      magnitude.dispose();
+      powerSpec.dispose();
+      melMatrix.dispose();
+      melSpec.dispose();
+      logMelSpec.dispose();
+      if (disposeFramedInput) {
+        framedInput.dispose();
+      }
+      patches.dispose();
+      mergedPatch.dispose();
+      slices.forEach((s) => s.dispose());
+    }
+
+    const logits = await output.data();
+    if (output.dispose) {
+      output.dispose();
+    }
+    if (!logits || logits.length === 0) {
+      return [];
+    }
+
+    // Average logits across patches, then softmax
+    const numClasses = logits.length / numPatches;
+    const classTotals = new Float32Array(numClasses);
+    for (let i = 0; i < logits.length; i++) {
+      classTotals[i % numClasses] += logits[i];
+    }
+    const avgLogits = Array.from(classTotals).map((v) => v / numPatches);
+    const { maxIdx, maxProb } = softmaxTop1(avgLogits);
+
+    const latencyMs = Math.max(Math.round(performance.now() - start), 1);
+    const confidence = Math.max(Math.min(maxProb, 1), 0);
+    const label =
+      inferenceState.classMap[maxIdx] ||
+      `audio_class_${maxIdx}`;
+
+    return [
+      {
+        class: label,
+        confidence,
+        timestamp: endTs.toISOString(),
+        model_id: inferenceState.audioModelId,
+        inference_latency_ms: latencyMs,
+        origin: "client",
+      },
+    ];
+  } catch (error) {
+    console.error("Audio inference failed", error);
+    return [];
+  }
+}
+
+async function runVideoInference(blob, startTs, endTs) {
+  try {
+    const model = await loadVideoModel();
+    const frameCount = Math.max(inferenceState.videoFrameCount, 1);
+    const inputSize = Math.max(inferenceState.videoInputSize, 1);
+    const fallbackDurationSec = Math.max(
+      (endTs.getTime() - startTs.getTime()) / 1000,
+      0.001,
+    );
+    const frames = await sampleVideoFrames(
+      blob,
+      frameCount,
+      inputSize,
+      fallbackDurationSec,
+    );
+    if (!frames || !frames.data || !frames.frameCount) {
+      return [];
+    }
+
+    const inputTensor = window.tf.tensor(
+      frames.data,
+      [1, frameCount, inputSize, inputSize, 3],
+      "float32",
+    );
+
+    const start = performance.now();
+    let output;
+    try {
+      output = model.predict(inputTensor);
+    } finally {
+      inputTensor.dispose();
+    }
+
+    let logits;
+    if (output?.dataSync) {
+      logits = output.dataSync();
+    } else if (output?.data) {
+      logits = await output.data();
+    } else if (ArrayBuffer.isView(output)) {
+      logits = output;
+    } else if (Array.isArray(output)) {
+      logits = output;
+    } else if (output == null) {
+      console.warn("Video inference returned no output tensor");
+      return [];
+    } else {
+      console.warn("Video inference returned unexpected output", output);
+      return [];
+    }
+    if (output?.dispose) {
+      output.dispose();
+    }
+    if (!logits || logits.length === 0) {
+      console.warn("Video inference produced empty logits");
+      return [];
+    }
+
+    const { maxIdx, maxProb } = softmaxTop1(Array.from(logits));
+    const label =
+      inferenceState.videoClassMap[maxIdx] ||
+      `video_class_${maxIdx}`;
+
+    const latencyMs = Math.max(Math.round(performance.now() - start), 1);
+    const confidence = Math.max(Math.min(maxProb, 1), 0);
+
+    return [
+      {
+        class: label,
+        confidence,
+        timestamp: endTs.toISOString(),
+        model_id: inferenceState.videoModelId,
+        inference_latency_ms: latencyMs,
+        origin: "client",
+      },
+    ];
+  } catch (error) {
+    console.error("Video inference failed", error);
+    return [];
+  }
+}
+
+async function sampleVideoFrames(blob, frameCount, targetSize, fallbackDurationSec = 0) {
+  if (typeof document === "undefined") {
+    return null;
+  }
+  const url = URL.createObjectURL(blob);
+  const video = document.createElement("video");
+  video.muted = true;
+  video.preload = "auto";
+  video.playsInline = true;
+  video.crossOrigin = "anonymous";
+  video.src = url;
+  if (video.load) {
+    video.load();
+  }
+
+  try {
+    await new Promise((resolve, reject) => {
+      const onMetadata = () => resolve();
+      const onError = (event) =>
+        reject(
+          new Error(event?.message || "Unable to decode video for inference"),
+        );
+      video.addEventListener("loadedmetadata", onMetadata, { once: true });
+      video.addEventListener("error", onError, { once: true });
+    });
+
+    if (
+      !video.videoWidth ||
+      !video.videoHeight ||
+      video.videoWidth <= 0 ||
+      video.videoHeight <= 0
+    ) {
+      console.warn("Video metadata missing width/height/duration; skipping video inference", {
+        width: video.videoWidth,
+        height: video.videoHeight,
+        duration: video.duration,
+      });
+      return null;
+    }
+
+    const rawDuration = Number.isFinite(video.duration) ? video.duration : fallbackDurationSec;
+    const safeDuration = Math.max(rawDuration, fallbackDurationSec, 0.001);
+    const canvas =
+      typeof OffscreenCanvas !== "undefined"
+        ? new OffscreenCanvas(targetSize, targetSize)
+        : (() => {
+            const element = document.createElement("canvas");
+            element.width = targetSize;
+            element.height = targetSize;
+            return element;
+          })();
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) {
+      return null;
+    }
+    if (ctx.canvas) {
+      ctx.canvas.width = targetSize;
+      ctx.canvas.height = targetSize;
+    }
+
+    const frames = new Float32Array(frameCount * targetSize * targetSize * 3);
+    const step = safeDuration / frameCount;
+    const sampleTimes = [];
+    for (let i = 0; i < frameCount; i++) {
+      const midpoint = step * (i + 0.5);
+      const clamped = Math.min(
+        Math.max(midpoint, 0),
+        Math.max(safeDuration - 0.001, 0),
+      );
+      sampleTimes.push(clamped);
+    }
+
+    for (let i = 0; i < sampleTimes.length; i++) {
+      try {
+        await seekVideo(video, sampleTimes[i]);
+      } catch (error) {
+        console.warn("Video seek failed; continuing with previous frame", error);
+      }
+      drawVideoFrame(ctx, video, targetSize);
+      const pixels = ctx.getImageData(0, 0, targetSize, targetSize).data;
+      const offset = i * targetSize * targetSize * 3;
+      normalizeFrame(pixels, frames, offset);
+    }
+
+    return { data: frames, frameCount };
+  } finally {
+    URL.revokeObjectURL(url);
+    video.src = "";
+  }
+}
+
+function seekVideo(video, timeSec) {
+  return new Promise((resolve, reject) => {
+    const clamped = Math.min(
+      Math.max(timeSec, 0),
+      Math.max((video.duration || 0) - 0.001, 0),
+    );
+    const cleanup = () => {
+      video.removeEventListener("seeked", onSeeked);
+      video.removeEventListener("error", onError);
+    };
+    const onSeeked = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = (event) => {
+      cleanup();
+      reject(
+        event?.error || new Error("Video seek failed during preprocessing"),
+      );
+    };
+
+    if (
+      video.readyState >= (window.HTMLMediaElement?.HAVE_CURRENT_DATA || 2) &&
+      Math.abs(video.currentTime - clamped) < 0.01
+    ) {
+      cleanup();
+      resolve();
+      return;
+    }
+
+    video.addEventListener("seeked", onSeeked, { once: true });
+    video.addEventListener("error", onError, { once: true });
+    try {
+      video.currentTime = clamped;
+    } catch (error) {
+      cleanup();
+      reject(error);
+    }
+  });
+}
+
+function drawVideoFrame(ctx, video, targetSize) {
+  const videoWidth = video.videoWidth || targetSize;
+  const videoHeight = video.videoHeight || targetSize;
+  const videoRatio = videoWidth / videoHeight;
+  let sx = 0;
+  let sy = 0;
+  let sw = videoWidth;
+  let sh = videoHeight;
+
+  if (videoRatio > 1) {
+    sh = videoHeight;
+    sw = sh;
+    sx = (videoWidth - sw) / 2;
+  } else if (videoRatio < 1) {
+    sw = videoWidth;
+    sh = sw;
+    sy = (videoHeight - sh) / 2;
+  }
+
+  ctx.drawImage(video, sx, sy, sw, sh, 0, 0, targetSize, targetSize);
+}
+
+function normalizeFrame(pixels, target, offset) {
+  const mean = kineticsNormalization.mean;
+  const std = kineticsNormalization.std;
+  let writeIndex = offset;
+  for (let i = 0; i < pixels.length; i += 4) {
+    const r = pixels[i] / 255;
+    const g = pixels[i + 1] / 255;
+    const b = pixels[i + 2] / 255;
+    target[writeIndex++] = (r - mean[0]) / std[0];
+    target[writeIndex++] = (g - mean[1]) / std[1];
+    target[writeIndex++] = (b - mean[2]) / std[2];
+  }
+}
+
+async function fetchModelFromCache(url) {
+  if (window.caches) {
+    const cache = await caches.open("buurt-models");
+    const cached = await cache.match(url);
+    if (cached) {
+      return cached.arrayBuffer();
+    }
+    const response = await fetch(url, { cache: "force-cache" });
+    await cache.put(url, response.clone());
+    return response.arrayBuffer();
+  }
+  const response = await fetch(url, { cache: "force-cache" });
+  return response.arrayBuffer();
+}
+
+async function loadScriptWithFallback(urls) {
+  for (const url of urls) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((resolve, reject) => {
+        const script = document.createElement("script");
+        script.src = url;
+        script.onload = () => resolve();
+        script.onerror = () => reject(new Error(`Failed to load ${url}`));
+        document.head.append(script);
+      });
+      return;
+    } catch (error) {
+      console.warn("Script load failed, trying next URL", url, error);
+    }
+  }
+  throw new Error("All script sources failed to load");
+}
+
+function softmaxTop1(values) {
+  let maxLogit = -Infinity;
+  for (let i = 0; i < values.length; i++) {
+    if (values[i] > maxLogit) {
+      maxLogit = values[i];
+    }
+  }
+  let sumExp = 0;
+  let maxIdx = 0;
+  let maxProb = 0;
+  for (let i = 0; i < values.length; i++) {
+    const expVal = Math.exp(values[i] - maxLogit);
+    sumExp += expVal;
+    if (expVal > maxProb) {
+      maxProb = expVal;
+      maxIdx = i;
+    }
+  }
+  if (sumExp > 0) {
+    maxProb /= sumExp;
+  }
+  return { maxIdx, maxProb };
+}
+
+async function loadClassMap() {
+  try {
+    const response = await fetch(inferenceState.classMapUrl, { cache: "force-cache" });
+    if (!response.ok) {
+      throw new Error(`Failed to fetch class map: ${response.statusText}`);
+    }
+    const text = await response.text();
+    const lines = text
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const headers = lines.shift(); // drop header
+    const labels = [];
+    for (const line of lines) {
+      const parts = line.trim().split(",");
+      // CSV format: index,mid,display_name
+      if (parts.length >= 3) {
+        labels.push(parts[2].replace(/(^\"|\"$)/g, "").trim());
+      }
+    }
+    return labels;
+  } catch (error) {
+    console.warn("Failed to load class map", error);
+    return [];
+  }
+}
+
+async function loadVideoClassMap() {
+  try {
+    const response = await fetch(inferenceState.videoClassMapUrl, { cache: "force-cache" });
+    if (!response.ok) {
+      throw new Error(`Failed to fetch video class map: ${response.statusText}`);
+    }
+    const text = await response.text();
+    return text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+  } catch (error) {
+    console.warn("Failed to load video class map", error);
+    return [];
+  }
+}
+
+function buildMelFilterbank(
+  numMelBins,
+  numSpectrogramBins,
+  sampleRate,
+  lowerEdgeHz,
+  upperEdgeHz,
+) {
+  const hzToMel = (hz) => 1127 * Math.log(1 + hz / 700);
+  const melToHz = (mel) => 700 * (Math.exp(mel / 1127) - 1);
+
+  const lowerMel = hzToMel(lowerEdgeHz);
+  const upperMel = hzToMel(upperEdgeHz);
+  const melPoints = new Float32Array(numMelBins + 2);
+  for (let i = 0; i < melPoints.length; i++) {
+    melPoints[i] = lowerMel + ((upperMel - lowerMel) * i) / (numMelBins + 1);
+  }
+  const hzPoints = melPoints.map(melToHz);
+  const binFrequencies = new Float32Array(numSpectrogramBins);
+  const linearFreqs = (sampleRate / 2) / (numSpectrogramBins - 1);
+  for (let i = 0; i < numSpectrogramBins; i++) {
+    binFrequencies[i] = i * linearFreqs;
+  }
+
+  const filterbank = [];
+  for (let m = 0; m < numMelBins; m++) {
+    const lower = hzPoints[m];
+    const center = hzPoints[m + 1];
+    const upper = hzPoints[m + 2];
+    const weights = new Float32Array(numSpectrogramBins);
+    for (let k = 0; k < numSpectrogramBins; k++) {
+      const freq = binFrequencies[k];
+      let w = 0;
+      if (freq >= lower && freq <= center) {
+        w = (freq - lower) / (center - lower + 1e-8);
+      } else if (freq > center && freq <= upper) {
+        w = (upper - freq) / (upper - center + 1e-8);
+      }
+      weights[k] = w;
+    }
+    filterbank.push(weights);
+  }
+
+  return window.tf.tensor2d(filterbank, [numMelBins, numSpectrogramBins]);
 }
 
 function stopLongPolling() {

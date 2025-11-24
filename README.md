@@ -131,9 +131,9 @@ Excluded (Future Phases):
 | Capture | Start/stop session | Implemented | FastAPI endpoints plus the browser control panel handle create/stop flows (`app/main.py`, `app/frontend/static/app.js`). |
 | Capture | Continuous AV segmentation | Partial (browser audio) | The control panel now streams live microphone audio via `MediaRecorder` and uploads segments to `/sessions/{id}/segments/upload`; the backend synthesiser remains as a fallback when capture is unavailable. |
 | Sensors | GPS + orientation capture | Partial (browser APIs) | Control panel now requests geolocation + device orientation on session start and falls back to Amsterdam defaults when permissions are denied. |
-| Inference | Local audio event classification | Stubbed | Backend fabricates a single `ambient_noise` detection per segment without model execution. |
-| Inference | Local video action recognition (lightweight) | Not implemented | No video processing or model loading logic exists. |
-| Detection | Fight / Robbery / Fireworks / Gunshot / Scream / Glass Break / Vehicle Crash | Not implemented | Only the placeholder `ambient_noise` class is produced; planned incident classes are absent in API/UI. |
+| Inference | Local audio event classification | Implemented (client-side TFLite) | Browser runs YamNet (`/static/tflite/YamNet_float.tflite`) via TF.js/TFLite WASM; detections are attached to uploads when the runtime is available. Backend still fabricates detections when uploads omit inference. |
+| Inference | Local video action recognition (lightweight) | Implemented (client-side TFLite) | Browser samples 16 frames, center-crops to 112×112, normalises with Kinetics-400 stats, and feeds the Qualcomm ResNet-Mixed-Convolution TFLite model; top-1 labels are attached to uploads. |
+| Detection | Fight / Robbery / Fireworks / Gunshot / Scream / Glass Break / Vehicle Crash | Partial | Kinetics-400 (video) and YamNet (audio) labels are attached to uploads; incident-specific mapping and UX overlays remain to be built. |
 | UX | Real-time detection overlay + confidence | Not implemented | Control panel shows session metadata only and lacks detection visualisation. |
 | Storage | Local file + metadata store (IndexedDB / File System Access API) | Not implemented on client | Persistence currently happens server-side (SQLite + `recordings/`), with no browser-side IndexedDB/File System Access usage. |
 | Alerts | Local UI alert only | Not implemented | No detection-triggered notifications beyond generic status text. |
@@ -260,6 +260,8 @@ Phase 3: Advanced analytics (heatmaps, temporal trends, predictive modeling), mo
 - **Imminent validation**: flesh out backend unit and integration tests that cover session lifecycle endpoints and health reporting.
 - **Upcoming refactor**: extract a storage abstraction layer to support swapping local development storage for cloud backends without touching route logic.
 - **Future persistence**: design durable session archival (object storage + metadata DB) once on-device retention limits are defined.
+- **Inference config**: toggle audio/video detectors and thresholds via environment flags (`BUURT_ENABLE_AUDIO_INFER`, `BUURT_ENABLE_VIDEO_INFER`, `BUURT_INFER_THRESHOLD`, `BUURT_CLASS_COOLDOWN_SEC`, `BUURT_AUDIO_MODEL_ID`, `BUURT_VIDEO_MODEL_ID`). `/health` now returns inference stats for quick observability.
+  - Optional model paths: `BUURT_AUDIO_MODEL_PATH` (YAMNet TFLite) and `BUURT_VIDEO_MODEL_PATH` (YOLO TFLite); if absent or tflite_runtime is missing, the service runs in a stubbed-but-degraded mode with readiness reflected in `/health`.
 
 ## 15. Installation (Draft Placeholder)
 Prerequisites:
@@ -328,11 +330,14 @@ http GET :8000/sessions/{session_id}
 curl -X GET http://localhost:8000/sessions/{session_id}
 ```
 
+#### Upload a Recorded Segment with Client Detections (`POST /sessions/{session_id}/segments/upload`)
+- Fields: `index`, `start_ts`, `end_ts`, `file` (multipart), optional `detections` JSON array shaped like `{"class": "gunshot", "confidence": 0.9, "timestamp": "<iso8601>"}` produced by on-device inference (e.g., TF.js/WASM). When provided, the backend persists those detections and skips its synthetic inference for that segment.
+
 ## 17. Development Tasks (Next)
 - Implement Python FastAPI inference service skeleton.
 - Integrate React PWA media capture (video+audio) + segmentation (30s w/5s overlap).
 - Frame & audio sampling pipeline (every 2nd frame, sliding audio window).
-- TFLite model loading (YOLOv8n tiny + YAMNet + action classifier placeholder).
+- TFLite model loading (YAMNet audio + ResNet-Mixed-Convolution video; YOLO still TBD).
 - Detection overlay UI with confidence & cooldown handling.
 - Local persistence (IndexedDB + file storage) of segments & metadata.
 - Configuration panel (segment length, overlap, confidence threshold, cooldown).
@@ -344,6 +349,17 @@ curl -X GET http://localhost:8000/sessions/{session_id}
 - Integration: end-to-end mock session -> stored detections.
 - Model sanity: sample clips produce expected class probabilities.
 - Future: confusion matrix generation, performance benchmarks on low-end devices.
+
+### Frontend model integration tests (optional/heavy)
+These tests run the browser-side TFLite models (YamNet + ResNet-Mixed-Convolution) via Playwright. They download the full models and are skipped unless explicitly enabled.
+
+```bash
+# install JS test deps
+npm install
+
+# run expensive model checks (downloads models; needs network)
+RUN_MODEL_TESTS=1 npm run test:frontend
+```
 
 ### Running Tests
 
