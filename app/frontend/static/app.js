@@ -15,6 +15,7 @@ const captureState = {
   context: null,
   uploads: [],
   orientationPermissionRequested: false,
+  inference: null,
 };
 
 const inferenceState = {
@@ -165,17 +166,28 @@ async function fetchJson(url, options) {
 async function getMobileDetections(blob, startTs, endTs, index) {
   try {
     await ensureInferenceRuntime();
-    const hasVideo = typeof blob.type === "string" && blob.type.startsWith("video/");
-    const [audioDetections, videoDetections] = await Promise.all([
-      runAudioInference(blob, endTs),
-      hasVideo ? runVideoInference(blob, startTs, endTs) : Promise.resolve([]),
-    ]);
-    if (!hasVideo) {
-      console.info("Skipping video inference: blob is not a video", { mime: blob.type });
+    const inference = captureState.inference;
+    if (!inference) {
+      console.warn("Inference pipeline missing; skipping detections");
+      return [];
     }
+    const segmentAudio = inference.consumeAudioSegment();
+    const segmentVideo = inference.consumeVideoFrames();
+    const [audioDetections, videoDetections] = await Promise.all([
+      segmentAudio
+        ? runAudioInference(segmentAudio.pcm, segmentAudio.sampleRate, endTs)
+        : [],
+      segmentVideo?.frameCount
+        ? runVideoInference(segmentVideo, startTs, endTs)
+        : [],
+    ]);
+    inference.resetSegment(endTs);
     return [...(audioDetections || []), ...(videoDetections || [])];
   } catch (error) {
     console.warn("Mobile inference unavailable, skipping detections", error);
+    if (captureState.inference) {
+      captureState.inference.resetSegment();
+    }
     return [];
   }
 }
@@ -252,7 +264,7 @@ async function buildSessionPayload() {
     gps_origin: gpsOrigin,
     orientation_origin: orientationOrigin,
     config_snapshot: {
-      segment_length_sec: 30,
+      segment_length_sec: 10,
       overlap_sec: 5,
       confidence_threshold: 0.1,
     },
@@ -381,7 +393,7 @@ async function startMediaCapture(session) {
   }
 
   const segmentLengthSec =
-    session?.config_snapshot?.segment_length_sec ?? 30;
+    session?.config_snapshot?.segment_length_sec ?? 10;
   const segmentLengthMs = Math.max(segmentLengthSec * 1000, 1000);
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: true,
@@ -393,6 +405,12 @@ async function startMediaCapture(session) {
   });
   const options = resolveRecorderOptions(stream);
   const recorder = new MediaRecorder(stream, options);
+  try {
+    captureState.inference = await startLiveInference(stream, segmentLengthMs);
+  } catch (error) {
+    console.warn("Live inference pipeline failed to start; continuing without client detections", error);
+    captureState.inference = null;
+  }
   const context = {
     sessionId: session.id,
     recorder,
@@ -404,6 +422,9 @@ async function startMediaCapture(session) {
 
   recorder.addEventListener("start", () => {
     context.segmentStart = new Date();
+    if (captureState.inference) {
+      captureState.inference.resetSegment();
+    }
   });
 
   recorder.addEventListener("dataavailable", (event) => {
@@ -414,13 +435,22 @@ async function startMediaCapture(session) {
     const start = context.segmentStart ?? new Date();
     const end = new Date();
     context.segmentStart = end;
-    const uploadPromise = uploadSegmentBlob(
-      context.sessionId,
-      context.segmentIndex,
-      start,
-      end,
-      event.data,
-    );
+    const uploadPromise = (async () => {
+      const detections = await getMobileDetections(
+        event.data,
+        start,
+        end,
+        context.segmentIndex,
+      );
+      return uploadSegmentBlob(
+        context.sessionId,
+        context.segmentIndex,
+        start,
+        end,
+        event.data,
+        detections,
+      );
+    })();
     captureState.uploads.push(uploadPromise);
     uploadPromise
       .catch((error) => {
@@ -444,6 +474,14 @@ async function startMediaCapture(session) {
   try {
     recorder.start(segmentLengthMs);
   } catch (error) {
+    if (captureState.inference) {
+      try {
+        captureState.inference.stop();
+      } catch (stopError) {
+        console.warn("Failed to stop inference after recorder error", stopError);
+      }
+      captureState.inference = null;
+    }
     stream.getTracks().forEach((track) => track.stop());
     throw error;
   }
@@ -455,14 +493,20 @@ function resolveRecorderOptions(stream) {
     return {};
   }
 
+  const userAgent = navigator.userAgent?.toLowerCase() || "";
+  const isSafari =
+    userAgent.includes("safari") &&
+    !userAgent.includes("chrome") &&
+    !userAgent.includes("android");
   const hasVideo = stream.getVideoTracks().length > 0;
   const candidates = hasVideo
-    ? [
-        "video/webm;codecs=vp9,opus",
-        "video/webm;codecs=vp8,opus",
-        "video/webm",
-        "video/mp4",
-      ]
+    ? isSafari
+      ? [
+          "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+          "video/mp4",
+          "video/webm;codecs=vp8,opus",
+        ]
+      : ["video/webm;codecs=vp8,opus", "video/webm", "video/mp4"]
     : ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
 
   const supported = candidates.find((type) =>
@@ -472,10 +516,316 @@ function resolveRecorderOptions(stream) {
   return supported ? { mimeType: supported } : {};
 }
 
+function createInferenceBuffers() {
+  let audioChunks = [];
+  let audioSampleRate = null;
+  let videoFrames = [];
+  const maxVideoFrames = Math.max(inferenceState.videoFrameCount * 3, 24);
+
+  return {
+    setAudioSampleRate(rate) {
+      audioSampleRate = rate;
+    },
+    pushAudioChunk(chunk) {
+      if (!chunk || !chunk.length) {
+        return;
+      }
+      const copy = new Float32Array(chunk.length);
+      copy.set(chunk);
+      audioChunks.push(copy);
+    },
+    pushVideoFrame(frameData) {
+      if (!frameData || !frameData.length) {
+        return;
+      }
+      videoFrames.push(frameData);
+      if (videoFrames.length > maxVideoFrames) {
+        videoFrames.shift();
+      }
+    },
+    consumeAudioSegment() {
+      if (!audioChunks.length || !audioSampleRate) {
+        return null;
+      }
+      const totalLength = audioChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+      const merged = new Float32Array(totalLength);
+      let offset = 0;
+      for (const chunk of audioChunks) {
+        merged.set(chunk, offset);
+        offset += chunk.length;
+      }
+      audioChunks = [];
+      return { pcm: merged, sampleRate: audioSampleRate };
+    },
+    consumeVideoFrames() {
+      if (!videoFrames.length) {
+        return null;
+      }
+      const frameCount = Math.min(
+        videoFrames.length,
+        Math.max(inferenceState.videoFrameCount, 1),
+      );
+      const startIndex = Math.max(videoFrames.length - frameCount, 0);
+      const selected = videoFrames.slice(startIndex);
+      const targetSize = Math.max(inferenceState.videoInputSize, 1);
+      const data = new Float32Array(frameCount * targetSize * targetSize * 3);
+      for (let i = 0; i < selected.length; i++) {
+        data.set(selected[i], i * selected[i].length);
+      }
+      videoFrames = [];
+      return { data, frameCount };
+    },
+    resetSegment() {
+      audioChunks = [];
+      videoFrames = [];
+    },
+    hasAudioData() {
+      return audioChunks.length > 0;
+    },
+    hasVideoData() {
+      return videoFrames.length > 0;
+    },
+  };
+}
+
+async function startLiveInference(stream, segmentLengthMs) {
+  const buffers = createInferenceBuffers();
+  const videoTrack = stream.getVideoTracks()[0] || null;
+  const audioTrack = stream.getAudioTracks()[0] || null;
+  const stopFns = [];
+  let stopped = false;
+  let audioEnabled = Boolean(audioTrack);
+  let videoEnabled = Boolean(videoTrack);
+
+  if (audioTrack) {
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    buffers.setAudioSampleRate(audioCtx.sampleRate);
+    const source = audioCtx.createMediaStreamSource(new MediaStream([audioTrack]));
+    if (audioCtx.audioWorklet) {
+      const workletCode = `
+class CaptureProcessor extends AudioWorkletProcessor {
+  process(inputs) {
+    const input = inputs?.[0]?.[0];
+    if (input) {
+      this.port.postMessage(input);
+    }
+    return true;
+  }
+}
+registerProcessor("capture-processor", CaptureProcessor);
+`;
+      const workletUrl = URL.createObjectURL(
+        new Blob([workletCode], { type: "application/javascript" }),
+      );
+      try {
+        await audioCtx.audioWorklet.addModule(workletUrl);
+        const node = new AudioWorkletNode(audioCtx, "capture-processor", {
+          numberOfInputs: 1,
+          numberOfOutputs: 0,
+          channelCount: 1,
+        });
+        node.port.onmessage = (event) => {
+          buffers.pushAudioChunk(event.data);
+        };
+        source.connect(node);
+        stopFns.push(() => {
+          node.port.onmessage = null;
+          node.disconnect();
+          source.disconnect();
+          audioCtx.close().catch(() => {});
+          URL.revokeObjectURL(workletUrl);
+        });
+      } catch (error) {
+        console.warn("AudioWorklet unavailable, falling back to ScriptProcessor", error);
+        URL.revokeObjectURL(workletUrl);
+        const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+        processor.onaudioprocess = (event) => {
+          buffers.pushAudioChunk(event.inputBuffer.getChannelData(0));
+        };
+        source.connect(processor);
+        processor.connect(audioCtx.destination);
+        stopFns.push(() => {
+          processor.disconnect();
+          source.disconnect();
+          audioCtx.close().catch(() => {});
+        });
+      }
+    } else {
+      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      processor.onaudioprocess = (event) => {
+        buffers.pushAudioChunk(event.inputBuffer.getChannelData(0));
+      };
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
+      stopFns.push(() => {
+        processor.disconnect();
+        source.disconnect();
+        audioCtx.close().catch(() => {});
+      });
+    }
+  }
+
+  if (videoTrack) {
+    const targetSize = Math.max(inferenceState.videoInputSize, 1);
+    const frameIntervalMs = Math.max(
+      segmentLengthMs / Math.max(inferenceState.videoFrameCount, 1),
+      50,
+    );
+    let lastCapture = 0;
+
+    const canvas =
+      typeof OffscreenCanvas !== "undefined"
+        ? new OffscreenCanvas(targetSize, targetSize)
+        : (() => {
+            const element = document.createElement("canvas");
+            element.width = targetSize;
+            element.height = targetSize;
+            return element;
+          })();
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) {
+      videoEnabled = false;
+    }
+
+    const captureFrame = async (source) => {
+      if (stopped || !ctx) {
+        return;
+      }
+      const now = performance.now();
+      if (now - lastCapture < frameIntervalMs) {
+        return;
+      }
+      lastCapture = now;
+      try {
+        drawFrameToCanvas(ctx, source, targetSize);
+        const pixels = ctx.getImageData(0, 0, targetSize, targetSize).data;
+        const frameData = new Float32Array(targetSize * targetSize * 3);
+        normalizeFrame(pixels, frameData, 0);
+        buffers.pushVideoFrame(frameData);
+      } catch (error) {
+        console.warn("Video frame capture failed", error);
+      }
+    };
+
+    if (window.MediaStreamTrackProcessor && window.VideoFrame) {
+      try {
+        const processor = new MediaStreamTrackProcessor({ track: videoTrack });
+        const reader = processor.readable.getReader();
+        const readLoop = async () => {
+          if (stopped) {
+            return;
+          }
+          const { value, done } = await reader.read();
+          if (done || stopped) {
+            return;
+          }
+          const frame = value;
+          await captureFrame(frame);
+          frame.close();
+          readLoop();
+        };
+        readLoop();
+        stopFns.push(() => {
+          reader.cancel().catch(() => {});
+        });
+      } catch (error) {
+        console.warn("MediaStreamTrackProcessor unavailable; falling back to video element", error);
+        const video = document.createElement("video");
+        video.srcObject = new MediaStream([videoTrack]);
+        video.muted = true;
+        video.playsInline = true;
+        video.preload = "auto";
+        video.addEventListener("loadedmetadata", () => {
+          video.play().catch(() => {});
+        }, { once: true });
+        let rafId = null;
+        const loop = () => {
+          captureFrame(video);
+          if (!stopped) {
+            rafId = requestAnimationFrame(loop);
+          }
+        };
+        rafId = requestAnimationFrame(loop);
+        stopFns.push(() => {
+          if (rafId) {
+            cancelAnimationFrame(rafId);
+          }
+          video.srcObject = null;
+        });
+      }
+    } else {
+      const video = document.createElement("video");
+      video.srcObject = new MediaStream([videoTrack]);
+      video.muted = true;
+      video.playsInline = true;
+      video.preload = "auto";
+      video.addEventListener("loadedmetadata", () => {
+        video.play().catch(() => {});
+      }, { once: true });
+      let rafId = null;
+      const loop = () => {
+        captureFrame(video);
+        if (!stopped) {
+          rafId = requestAnimationFrame(loop);
+        }
+      };
+      rafId = requestAnimationFrame(loop);
+      stopFns.push(() => {
+        if (rafId) {
+          cancelAnimationFrame(rafId);
+        }
+        video.srcObject = null;
+      });
+    }
+  }
+
+  window.setTimeout(() => {
+    if (audioTrack && !buffers.hasAudioData()) {
+      audioEnabled = false;
+      console.warn("Audio inference disabled: no PCM captured from live stream");
+    }
+    if (videoTrack && !buffers.hasVideoData()) {
+      videoEnabled = false;
+      console.warn("Video inference disabled: unable to read frames from live stream");
+    }
+  }, 1000);
+
+  return {
+    consumeAudioSegment() {
+      return audioEnabled ? buffers.consumeAudioSegment() : null;
+    },
+    consumeVideoFrames() {
+      return videoEnabled ? buffers.consumeVideoFrames() : null;
+    },
+    resetSegment() {
+      buffers.resetSegment();
+    },
+    stop() {
+      stopped = true;
+      stopFns.forEach((fn) => {
+        try {
+          fn();
+        } catch (error) {
+          console.warn("Failed to stop inference component", error);
+        }
+      });
+    },
+  };
+}
+
 async function stopMediaCapture() {
   const context = captureState.context;
   if (!context) {
     return;
+  }
+
+  if (captureState.inference) {
+    try {
+      captureState.inference.stop();
+    } catch (error) {
+      console.warn("Failed to stop inference pipelines", error);
+    }
+    captureState.inference = null;
   }
 
   captureState.context = null;
@@ -500,7 +850,14 @@ async function stopMediaCapture() {
   }
 }
 
-async function uploadSegmentBlob(sessionId, index, startTs, endTs, blob) {
+async function uploadSegmentBlob(
+  sessionId,
+  index,
+  startTs,
+  endTs,
+  blob,
+  detections = null,
+) {
   const formData = new FormData();
   formData.append("index", String(index));
   formData.append("start_ts", startTs.toISOString());
@@ -511,7 +868,6 @@ async function uploadSegmentBlob(sessionId, index, startTs, endTs, blob) {
     `segment-${String(index).padStart(4, "0")}.webm`,
   );
 
-  const detections = await getMobileDetections(blob, startTs, endTs, index);
   if (detections && detections.length) {
     formData.append("detections", JSON.stringify(detections));
   }
@@ -588,6 +944,7 @@ async function ensureInferenceRuntime() {
     // Load full TensorFlow.js bundle (includes CPU backend)
     if (!window.tf) {
       const tfUrls = [
+        `${inferenceState.wasmBaseUrl}/tf.min.js`,
         "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js",
         "https://unpkg.com/@tensorflow/tfjs@4.20.0/dist/tf.min.js",
       ];
@@ -696,25 +1053,47 @@ async function loadVideoModel() {
 
 function downsampleToMono(audioBuffer, targetRate = 16000) {
   const channelData = audioBuffer.getChannelData(0);
-  if (audioBuffer.sampleRate === targetRate) {
-    return channelData;
+  return downsamplePcm(channelData, audioBuffer.sampleRate, targetRate);
+}
+
+function downsamplePcm(samples, sourceRate, targetRate = 16000) {
+  if (!samples || !samples.length || !sourceRate) {
+    return new Float32Array();
   }
-  const ratio = audioBuffer.sampleRate / targetRate;
-  const newLength = Math.floor(channelData.length / ratio);
+  if (sourceRate === targetRate) {
+    return samples.slice ? samples.slice() : new Float32Array(samples);
+  }
+  const ratio = sourceRate / targetRate;
+  const newLength = Math.floor(samples.length / ratio);
   const result = new Float32Array(newLength);
   for (let i = 0; i < newLength; i++) {
-    result[i] = channelData[Math.floor(i * ratio)];
+    result[i] = samples[Math.floor(i * ratio)];
   }
   return result;
 }
 
-async function runAudioInference(blob, endTs) {
+async function runAudioInference(audioInput, sampleRate, endTs) {
   try {
     const model = await loadAudioModel();
-    const arrayBuffer = await blob.arrayBuffer();
-    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const decoded = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
-    const mono = downsampleToMono(decoded, 16000);
+    let mono = new Float32Array();
+    if (audioInput instanceof Blob) {
+      const arrayBuffer = await audioInput.arrayBuffer();
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const decoded = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+      mono = downsampleToMono(decoded, 16000);
+    } else if (audioInput instanceof Float32Array || Array.isArray(audioInput)) {
+      const rate = sampleRate || 48000;
+      mono = downsamplePcm(audioInput, rate, 16000);
+    } else if (audioInput?.pcm) {
+      const rate = audioInput.sampleRate || sampleRate || 48000;
+      mono = downsamplePcm(audioInput.pcm, rate, 16000);
+    } else {
+      console.warn("Audio inference input missing");
+      return [];
+    }
+    if (!mono.length) {
+      return [];
+    }
 
     const start = performance.now();
     // Compute log-mel spectrogram patches
@@ -844,27 +1223,70 @@ async function runAudioInference(blob, endTs) {
   }
 }
 
-async function runVideoInference(blob, startTs, endTs) {
+async function runVideoInference(videoSource, startTs, endTs) {
   try {
     const model = await loadVideoModel();
-    const frameCount = Math.max(inferenceState.videoFrameCount, 1);
     const inputSize = Math.max(inferenceState.videoInputSize, 1);
-    const fallbackDurationSec = Math.max(
-      (endTs.getTime() - startTs.getTime()) / 1000,
-      0.001,
-    );
-    const frames = await sampleVideoFrames(
-      blob,
-      frameCount,
-      inputSize,
-      fallbackDurationSec,
-    );
+    const expectedFrameCount = Math.max(inferenceState.videoFrameCount, 1);
+    const frameSize = inputSize * inputSize * 3;
+    let frames = null;
+    if (videoSource?.data && videoSource.frameCount) {
+      frames = videoSource;
+    } else if (videoSource instanceof Blob) {
+      const fallbackDurationSec = Math.max(
+        (endTs.getTime() - startTs.getTime()) / 1000,
+        0.001,
+      );
+      frames = await sampleVideoFrames(
+        videoSource,
+        expectedFrameCount,
+        inputSize,
+        fallbackDurationSec,
+      );
+    } else {
+      console.warn("Video inference source missing; skipping video inference");
+      return [];
+    }
     if (!frames || !frames.data || !frames.frameCount) {
+      return [];
+    }
+    let frameCount = Math.max(frames.frameCount, 1);
+    let frameData = frames.data;
+    const expectedLength = expectedFrameCount * frameSize;
+    const availableLength = frameData.length;
+    if (frameCount < expectedFrameCount && availableLength >= frameSize) {
+      const padded = new Float32Array(expectedLength);
+      const copyCount = Math.min(frameCount, expectedFrameCount);
+      for (let i = 0; i < copyCount; i++) {
+        padded.set(
+          frameData.subarray(i * frameSize, (i + 1) * frameSize),
+          i * frameSize,
+        );
+      }
+      const repeatStart = Math.max(copyCount - 1, 0) * frameSize;
+      const repeatSlice = frameData.subarray(
+        repeatStart,
+        repeatStart + frameSize,
+      );
+      for (let i = copyCount; i < expectedFrameCount; i++) {
+        padded.set(repeatSlice, i * frameSize);
+      }
+      frameData = padded;
+      frameCount = expectedFrameCount;
+    } else if (frameCount > expectedFrameCount && availableLength >= expectedLength) {
+      const startIndex = frameCount - expectedFrameCount;
+      frameData = frameData.subarray(
+        startIndex * frameSize,
+        startIndex * frameSize + expectedLength,
+      );
+      frameCount = expectedFrameCount;
+    } else if (frameData.length < frameCount * frameSize) {
+      console.warn("Video inference frame data incomplete; skipping video inference");
       return [];
     }
 
     const inputTensor = window.tf.tensor(
-      frames.data,
+      frameData,
       [1, frameCount, inputSize, inputSize, 3],
       "float32",
     );
@@ -1058,8 +1480,22 @@ function seekVideo(video, timeSec) {
 }
 
 function drawVideoFrame(ctx, video, targetSize) {
-  const videoWidth = video.videoWidth || targetSize;
-  const videoHeight = video.videoHeight || targetSize;
+  drawFrameToCanvas(ctx, video, targetSize);
+}
+
+function drawFrameToCanvas(ctx, source, targetSize) {
+  const videoWidth =
+    source?.videoWidth ||
+    source?.displayWidth ||
+    source?.width ||
+    source?.codedWidth ||
+    targetSize;
+  const videoHeight =
+    source?.videoHeight ||
+    source?.displayHeight ||
+    source?.height ||
+    source?.codedHeight ||
+    targetSize;
   const videoRatio = videoWidth / videoHeight;
   let sx = 0;
   let sy = 0;
@@ -1076,7 +1512,9 @@ function drawVideoFrame(ctx, video, targetSize) {
     sy = (videoHeight - sh) / 2;
   }
 
-  ctx.drawImage(video, sx, sy, sw, sh, 0, 0, targetSize, targetSize);
+  if (typeof ctx.drawImage === "function") {
+    ctx.drawImage(source, sx, sy, sw, sh, 0, 0, targetSize, targetSize);
+  }
 }
 
 function normalizeFrame(pixels, target, offset) {
