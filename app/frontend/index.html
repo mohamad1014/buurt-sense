@@ -25,6 +25,41 @@
           <p id="status-message" role="status" aria-live="polite" class="status">
             Ready to start a new session.
           </p>
+          <p id="recording-banner" class="recording-banner" hidden>
+            Recording…
+          </p>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="preview-title">
+        <div class="panel-header">
+          <h2 id="preview-title">Live preview</h2>
+          <button id="toggle-preview" type="button" class="ghost small">
+            Enable preview
+          </button>
+        </div>
+        <div class="panel-body preview-body">
+          <video
+            id="capture-preview"
+            playsinline
+            muted
+            autoplay
+            class="preview-video"
+          ></video>
+          <p id="preview-help" class="field-hint">
+            Enable the preview in the settings panel to monitor the camera feed locally.
+          </p>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="detection-feed-title">
+        <div class="panel-header">
+          <h2 id="detection-feed-title">Live detections</h2>
+          <button id="clear-detections" type="button" class="ghost">Clear</button>
+        </div>
+        <div class="panel-body">
+          <p id="detection-empty" class="field-hint">No detections yet.</p>
+          <ul id="detection-feed" class="detection-list" aria-live="polite"></ul>
         </div>
       </section>
 
@@ -36,10 +71,13 @@
           <form id="capture-settings-form" class="config-form">
             <div class="form-grid">
               <label class="form-field" for="config-segment-length">
-                <span>Segment length (seconds)</span>
+                <div class="field-header">
+                  <span>Segment length (seconds)</span>
+                  <span id="segment-length-display" class="field-value">10s</span>
+                </div>
                 <input
                   id="config-segment-length"
-                  type="number"
+                  type="range"
                   min="5"
                   max="60"
                   step="5"
@@ -48,10 +86,13 @@
                 <span class="field-hint">Each upload chunk duration.</span>
               </label>
               <label class="form-field" for="config-overlap">
-                <span>Overlap (seconds)</span>
+                <div class="field-header">
+                  <span>Overlap (seconds)</span>
+                  <span id="overlap-display" class="field-value">5s</span>
+                </div>
                 <input
                   id="config-overlap"
-                  type="number"
+                  type="range"
                   min="0"
                   max="9"
                   step="1"
@@ -60,10 +101,13 @@
                 <span class="field-hint">How much each chunk overlaps the previous one.</span>
               </label>
               <label class="form-field" for="config-confidence">
-                <span>Detection confidence ≥</span>
+                <div class="field-header">
+                  <span>Detection confidence ≥</span>
+                  <span id="confidence-display" class="field-value">0.10</span>
+                </div>
                 <input
                   id="config-confidence"
-                  type="number"
+                  type="range"
                   min="0"
                   max="1"
                   step="0.05"
@@ -72,10 +116,9 @@
                 <span class="field-hint">Increase to reduce noise.</span>
               </label>
             </div>
-            <label class="checkbox-field" for="config-preview-toggle">
-              <input id="config-preview-toggle" type="checkbox" />
-              <span>Show live video preview while recording</span>
-            </label>
+            <button id="reset-config" type="button" class="ghost small">
+              Reset defaults
+            </button>
           </form>
         </div>
       </section>
@@ -92,24 +135,6 @@
         </div>
       </section>
 
-      <section class="panel" aria-labelledby="preview-title">
-        <div class="panel-header">
-          <h2 id="preview-title">Live preview</h2>
-        </div>
-        <div class="panel-body preview-body">
-          <video
-            id="capture-preview"
-            playsinline
-            muted
-            autoplay
-            class="preview-video"
-          ></video>
-          <p id="preview-help" class="field-hint">
-            Enable the preview in the settings panel to monitor the camera feed locally.
-          </p>
-        </div>
-      </section>
-
       <section class="panel" aria-labelledby="session-log-title">
         <div class="panel-header">
           <h2 id="session-log-title">Session history</h2>
@@ -117,17 +142,6 @@
         </div>
         <div class="panel-body">
           <ul id="session-list" class="session-list" aria-live="polite"></ul>
-        </div>
-      </section>
-
-      <section class="panel" aria-labelledby="detection-feed-title">
-        <div class="panel-header">
-          <h2 id="detection-feed-title">Live detections</h2>
-          <button id="clear-detections" type="button" class="ghost">Clear</button>
-        </div>
-        <div class="panel-body">
-          <p id="detection-empty" class="field-hint">No detections yet.</p>
-          <ul id="detection-feed" class="detection-list" aria-live="polite"></ul>
         </div>
       </section>
     </main>

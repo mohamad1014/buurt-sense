@@ -89,13 +89,34 @@ body {
   font-size: 0.95rem;
 }
 
-.form-field input {
+.field-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-weight: 600;
+}
+
+.field-value {
+  font-size: 0.9rem;
+  color: #bae6fd;
+}
+
+.form-field input[type="number"],
+.form-field input[type="range"] {
   border-radius: 10px;
   border: 1px solid rgba(148, 163, 184, 0.35);
   background: rgba(15, 23, 42, 0.5);
   color: #e2e8f0;
   padding: 0.55rem 0.75rem;
   font-size: 1rem;
+}
+
+.form-field input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  padding: 0;
+  height: 6px;
+  border-radius: 999px;
 }
 
 .form-field input:focus {
@@ -177,6 +198,12 @@ button.ghost:hover {
   border-color: rgba(148, 163, 184, 0.8);
 }
 
+button.ghost.small {
+  padding: 0.35rem 0.9rem;
+  font-size: 0.9rem;
+  border-radius: 12px;
+}
+
 .status {
   margin: 0;
   font-weight: 500;
@@ -189,6 +216,21 @@ button.ghost:hover {
 
 .status[data-tone="error"] {
   color: #fda4af;
+}
+
+.recording-banner {
+  margin-top: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: 10px;
+  background: rgba(56, 189, 248, 0.1);
+  border: 1px solid rgba(56, 189, 248, 0.3);
+  color: #bae6fd;
+  font-size: 0.95rem;
+  display: none;
+}
+
+.recording-banner[data-active="true"] {
+  display: block;
 }
 
 .session-details {

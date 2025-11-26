@@ -8,12 +8,18 @@ const captureSettingsForm = document.getElementById("capture-settings-form");
 const segmentLengthInput = document.getElementById("config-segment-length");
 const overlapInput = document.getElementById("config-overlap");
 const confidenceInput = document.getElementById("config-confidence");
-const previewToggle = document.getElementById("config-preview-toggle");
 const previewVideo = document.getElementById("capture-preview");
 const previewHelp = document.getElementById("preview-help");
 const detectionList = document.getElementById("detection-feed");
 const detectionEmptyState = document.getElementById("detection-empty");
 const clearDetectionsButton = document.getElementById("clear-detections");
+const resetConfigButton = document.getElementById("reset-config");
+const recordingBanner = document.getElementById("recording-banner");
+const previewToggleButton = document.getElementById("toggle-preview");
+const segmentLengthDisplay = document.getElementById("segment-length-display");
+const overlapDisplay = document.getElementById("overlap-display");
+const confidenceDisplay = document.getElementById("confidence-display");
+let recordingBannerInterval = null;
 
 let activeSession = null;
 let liveWebSocket = null;
@@ -157,12 +163,10 @@ function updateConfigFromInputs() {
       max: 1,
     },
   );
-  const preview = Boolean(previewToggle?.checked);
 
   userConfig.segment_length_sec = segment;
   userConfig.overlap_sec = overlap;
   userConfig.confidence_threshold = threshold;
-  userConfig.preview_enabled = preview;
   persistConfig();
   return getEffectiveConfig();
 }
@@ -182,17 +186,28 @@ function applyConfigToInputs() {
   if (confidenceInput) {
     confidenceInput.value = config.confidence_threshold.toFixed(2);
   }
-  if (previewToggle) {
-    previewToggle.checked = config.preview_enabled;
-  }
+  updateSliderDisplays(config);
+  updatePreviewToggleButton();
   updatePreviewVisibility();
+}
+
+function updateSliderDisplays(config = getEffectiveConfig()) {
+  if (segmentLengthDisplay) {
+    segmentLengthDisplay.textContent = `${config.segment_length_sec}s`;
+  }
+  if (overlapDisplay) {
+    overlapDisplay.textContent = `${config.overlap_sec}s`;
+  }
+  if (confidenceDisplay) {
+    confidenceDisplay.textContent = config.confidence_threshold.toFixed(2);
+  }
 }
 
 function updatePreviewVisibility(stream) {
   if (!previewVideo) {
     return;
   }
-  const shouldShow = Boolean(previewToggle?.checked) && Boolean(stream || previewVideo.srcObject);
+  const shouldShow = Boolean(userConfig.preview_enabled) && Boolean(stream || previewVideo.srcObject);
   if (shouldShow && stream) {
     previewVideo.srcObject = stream;
     previewVideo.muted = true;
@@ -226,6 +241,51 @@ function clearPreview() {
   previewVideo.classList.remove("is-visible");
   if (previewHelp) {
     previewHelp.hidden = false;
+  }
+}
+
+function updatePreviewToggleButton() {
+  if (!previewToggleButton) {
+    return;
+  }
+  previewToggleButton.textContent = userConfig.preview_enabled
+    ? "Disable preview"
+    : "Enable preview";
+  previewToggleButton.dataset.active = userConfig.preview_enabled ? "true" : "false";
+}
+
+function startRecordingBanner() {
+  if (!recordingBanner) {
+    return;
+  }
+  const startTime = new Date();
+  const update = () => {
+    if (!captureState.context) {
+      return;
+    }
+    const now = new Date();
+    const diffMs = now - startTime;
+    const minutes = String(Math.floor(diffMs / 60000)).padStart(2, "0");
+    const seconds = String(Math.floor((diffMs % 60000) / 1000)).padStart(2, "0");
+    const segments = captureState.context.segmentIndex;
+    recordingBanner.textContent = `Recording · ${minutes}:${seconds} elapsed · ${segments} segment${segments === 1 ? "" : "s"} uploaded`;
+    recordingBanner.dataset.active = "true";
+  };
+  update();
+  if (recordingBannerInterval) {
+    window.clearInterval(recordingBannerInterval);
+  }
+  recordingBannerInterval = window.setInterval(update, 1000);
+}
+
+function stopRecordingBanner() {
+  if (recordingBannerInterval) {
+    window.clearInterval(recordingBannerInterval);
+    recordingBannerInterval = null;
+  }
+  if (recordingBanner) {
+    recordingBanner.dataset.active = "false";
+    recordingBanner.textContent = "Recording…";
   }
 }
 
@@ -472,6 +532,7 @@ async function startSession() {
     activeSession = session;
     renderActiveSession(session);
     clearDetectionLog();
+    startRecordingBanner();
     toggleButtons(true);
     let captureError = null;
     try {
@@ -1099,6 +1160,7 @@ async function stopMediaCapture() {
   stream.getTracks().forEach((track) => track.stop());
   await stopPromise;
   clearPreview();
+  stopRecordingBanner();
 
   if (captureState.uploads.length) {
     const pending = [...captureState.uploads];
@@ -1157,6 +1219,7 @@ async function stopSession() {
     renderActiveSession(session);
     toggleButtons(false);
     setStatus("Session stopped.", "success");
+    stopRecordingBanner();
     await loadSessions({ announce: false });
   } catch (error) {
     console.error("Failed to stop session", error);
@@ -2069,26 +2132,35 @@ if (captureSettingsForm) {
   });
   captureSettingsForm.addEventListener("input", () => {
     const config = updateConfigFromInputs();
-    if (previewToggle) {
-      previewToggle.checked = config.preview_enabled;
-    }
-  });
-}
-
-if (previewToggle) {
-  previewToggle.addEventListener("change", () => {
-    const config = updateConfigFromInputs();
-    if (!config.preview_enabled) {
-      clearPreview();
-    } else if (captureState.context?.stream) {
-      updatePreviewVisibility(captureState.context.stream);
-    }
+    updateSliderDisplays(config);
   });
 }
 
 if (clearDetectionsButton) {
   clearDetectionsButton.addEventListener("click", () => {
     clearDetectionLog();
+  });
+}
+
+if (resetConfigButton) {
+  resetConfigButton.addEventListener("click", () => {
+    Object.assign(userConfig, { ...DEFAULT_CONFIG });
+    persistConfig();
+    applyConfigToInputs();
+    setStatus("Capture settings reset to defaults.", "info");
+  });
+}
+
+if (previewToggleButton) {
+  previewToggleButton.addEventListener("click", () => {
+    userConfig.preview_enabled = !userConfig.preview_enabled;
+    persistConfig();
+    updatePreviewToggleButton();
+    if (!userConfig.preview_enabled) {
+      clearPreview();
+    } else if (captureState.context?.stream) {
+      updatePreviewVisibility(captureState.context.stream);
+    }
   });
 }
 
