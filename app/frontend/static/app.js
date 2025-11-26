@@ -20,7 +20,9 @@ const captureState = {
 
 const inferenceState = {
   audioModel: null,
+  audioModelPromise: null,
   videoModel: null,
+  videoModelPromise: null,
   runtimeReady: false,
   loading: false,
   audioModelUrl:
@@ -435,16 +437,17 @@ async function startMediaCapture(session) {
     const start = context.segmentStart ?? new Date();
     const end = new Date();
     context.segmentStart = end;
+    const segmentIndex = context.segmentIndex;
     const uploadPromise = (async () => {
       const detections = await getMobileDetections(
         event.data,
         start,
         end,
-        context.segmentIndex,
+        segmentIndex,
       );
       return uploadSegmentBlob(
         context.sessionId,
-        context.segmentIndex,
+        segmentIndex,
         start,
         end,
         event.data,
@@ -986,6 +989,9 @@ async function loadAudioModel() {
   if (inferenceState.audioModel) {
     return inferenceState.audioModel;
   }
+  if (inferenceState.audioModelPromise) {
+    return inferenceState.audioModelPromise;
+  }
   if (!inferenceState.runtimeReady || !window.tflite) {
     throw new Error("Inference runtime not ready");
   }
@@ -993,34 +999,50 @@ async function loadAudioModel() {
     throw new Error("Audio model URL not configured");
   }
 
-  try {
-    // Load TFLite model from URL with options
-    inferenceState.audioModel = await window.tflite.loadTFLiteModel(
-      inferenceState.audioModelUrl,
-      {
-        numThreads: Math.max(navigator.hardwareConcurrency / 2 || 1, 1),
-      }
-    );
-    return inferenceState.audioModel;
-  } catch (error) {
-    console.error("Failed to load audio model from URL", error);
-    // Fallback: try loading from cache
+  const load = (async () => {
+    const threads = Math.max(navigator.hardwareConcurrency / 2 || 1, 1);
     try {
-      const buffer = await fetchModelFromCache(inferenceState.audioModelUrl);
-      inferenceState.audioModel = await window.tflite.loadTFLiteModel(buffer, {
-        numThreads: Math.max(navigator.hardwareConcurrency / 2 || 1, 1),
-      });
-      return inferenceState.audioModel;
-    } catch (fallbackError) {
-      console.error("Failed to load audio model from cache", fallbackError);
-      throw error;
+      const model = await window.tflite.loadTFLiteModel(
+        inferenceState.audioModelUrl,
+        { numThreads: threads },
+      );
+      inferenceState.audioModel = model;
+      return model;
+    } catch (primaryError) {
+      console.error("Failed to load audio model from URL", primaryError);
+      try {
+        const buffer = await fetchModelFromCache(
+          inferenceState.audioModelUrl,
+        );
+        const model = await window.tflite.loadTFLiteModel(buffer, {
+          numThreads: threads,
+        });
+        inferenceState.audioModel = model;
+        return model;
+      } catch (fallbackError) {
+        console.error("Failed to load audio model from cache", fallbackError);
+        throw fallbackError;
+      }
     }
-  }
+  })()
+    .catch((error) => {
+      inferenceState.audioModel = null;
+      throw error;
+    })
+    .finally(() => {
+      inferenceState.audioModelPromise = null;
+    });
+
+  inferenceState.audioModelPromise = load;
+  return load;
 }
 
 async function loadVideoModel() {
   if (inferenceState.videoModel) {
     return inferenceState.videoModel;
+  }
+  if (inferenceState.videoModelPromise) {
+    return inferenceState.videoModelPromise;
   }
   if (!inferenceState.runtimeReady || !window.tflite) {
     throw new Error("Inference runtime not ready");
@@ -1029,26 +1051,40 @@ async function loadVideoModel() {
     throw new Error("Video model URL not configured");
   }
 
-  const threads = Math.max(navigator.hardwareConcurrency / 2 || 1, 1);
-  try {
-    inferenceState.videoModel = await window.tflite.loadTFLiteModel(
-      inferenceState.videoModelUrl,
-      { numThreads: threads }
-    );
-    return inferenceState.videoModel;
-  } catch (error) {
-    console.error("Failed to load video model from URL", error);
+  const load = (async () => {
+    const threads = Math.max(navigator.hardwareConcurrency / 2 || 1, 1);
     try {
-      const buffer = await fetchModelFromCache(inferenceState.videoModelUrl);
-      inferenceState.videoModel = await window.tflite.loadTFLiteModel(buffer, {
-        numThreads: threads,
-      });
-      return inferenceState.videoModel;
-    } catch (fallbackError) {
-      console.error("Failed to load video model from cache", fallbackError);
-      throw error;
+      const model = await window.tflite.loadTFLiteModel(
+        inferenceState.videoModelUrl,
+        { numThreads: threads },
+      );
+      inferenceState.videoModel = model;
+      return model;
+    } catch (primaryError) {
+      console.error("Failed to load video model from URL", primaryError);
+      try {
+        const buffer = await fetchModelFromCache(inferenceState.videoModelUrl);
+        const model = await window.tflite.loadTFLiteModel(buffer, {
+          numThreads: threads,
+        });
+        inferenceState.videoModel = model;
+        return model;
+      } catch (fallbackError) {
+        console.error("Failed to load video model from cache", fallbackError);
+        throw fallbackError;
+      }
     }
-  }
+  })()
+    .catch((error) => {
+      inferenceState.videoModel = null;
+      throw error;
+    })
+    .finally(() => {
+      inferenceState.videoModelPromise = null;
+    });
+
+  inferenceState.videoModelPromise = load;
+  return load;
 }
 
 function downsampleToMono(audioBuffer, targetRate = 16000) {
