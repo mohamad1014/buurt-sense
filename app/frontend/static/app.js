@@ -4,6 +4,22 @@ const stopButton = document.getElementById("stop-session");
 const refreshButton = document.getElementById("refresh-sessions");
 const activeSessionDetails = document.getElementById("active-session-details");
 const sessionList = document.getElementById("session-list");
+const captureSettingsForm = document.getElementById("capture-settings-form");
+const segmentLengthInput = document.getElementById("config-segment-length");
+const overlapInput = document.getElementById("config-overlap");
+const confidenceInput = document.getElementById("config-confidence");
+const previewVideo = document.getElementById("capture-preview");
+const previewHelp = document.getElementById("preview-help");
+const detectionList = document.getElementById("detection-feed");
+const detectionEmptyState = document.getElementById("detection-empty");
+const clearDetectionsButton = document.getElementById("clear-detections");
+const resetConfigButton = document.getElementById("reset-config");
+const recordingBanner = document.getElementById("recording-banner");
+const previewToggleButton = document.getElementById("toggle-preview");
+const segmentLengthDisplay = document.getElementById("segment-length-display");
+const overlapDisplay = document.getElementById("overlap-display");
+const confidenceDisplay = document.getElementById("confidence-display");
+let recordingBannerInterval = null;
 
 let activeSession = null;
 let liveWebSocket = null;
@@ -11,6 +27,8 @@ let pollingTimer = null;
 let longPollController = null;
 let lastRevision = null;
 let shuttingDown = false;
+const CONFIG_STORAGE_KEY = "buurt-capture-config";
+const detectionLog = [];
 const captureState = {
   context: null,
   uploads: [],
@@ -20,7 +38,9 @@ const captureState = {
 
 const inferenceState = {
   audioModel: null,
+  audioModelPromise: null,
   videoModel: null,
+  videoModelPromise: null,
   runtimeReady: false,
   loading: false,
   audioModelUrl:
@@ -42,6 +62,296 @@ const inferenceState = {
   videoFrameCount: 16,
   videoInputSize: 112,
 };
+
+const DEFAULT_CONFIG = {
+  segment_length_sec: 10,
+  overlap_sec: 5,
+  confidence_threshold: 0.1,
+  preview_enabled: false,
+};
+
+function loadStoredConfig() {
+  try {
+    const raw = window.localStorage?.getItem(CONFIG_STORAGE_KEY);
+    if (!raw) {
+      return { ...DEFAULT_CONFIG };
+    }
+    const parsed = JSON.parse(raw);
+    return { ...DEFAULT_CONFIG, ...parsed };
+  } catch (error) {
+    console.warn("Failed to parse saved capture config", error);
+    return { ...DEFAULT_CONFIG };
+  }
+}
+
+const userConfig = loadStoredConfig();
+
+function persistConfig() {
+  try {
+    window.localStorage?.setItem(CONFIG_STORAGE_KEY, JSON.stringify(userConfig));
+  } catch (error) {
+    console.warn("Failed to persist capture config", error);
+  }
+}
+
+function clamp(value, min, max) {
+  let result = value;
+  if (typeof min === "number") {
+    result = Math.max(result, min);
+  }
+  if (typeof max === "number") {
+    result = Math.min(result, max);
+  }
+  return result;
+}
+
+function parseNumberInput(element, fallback, options = {}) {
+  const raw = element?.value?.trim();
+  const parsed = Number.parseFloat(raw);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return clamp(parsed, options.min, options.max);
+}
+
+function getEffectiveConfig() {
+  const segment = clamp(
+    Number(userConfig.segment_length_sec) || DEFAULT_CONFIG.segment_length_sec,
+    5,
+    60,
+  );
+  const overlap = clamp(
+    Number(userConfig.overlap_sec) ?? DEFAULT_CONFIG.overlap_sec,
+    0,
+    Math.max(segment - 1, 0),
+  );
+  const threshold = clamp(
+    Number(userConfig.confidence_threshold) ?? DEFAULT_CONFIG.confidence_threshold,
+    0,
+    1,
+  );
+  const preview = Boolean(userConfig.preview_enabled);
+  return {
+    segment_length_sec: segment,
+    overlap_sec: overlap,
+    confidence_threshold: threshold,
+    preview_enabled: preview,
+  };
+}
+
+function updateConfigFromInputs() {
+  if (!captureSettingsForm) {
+    return getEffectiveConfig();
+  }
+  const segment = parseNumberInput(segmentLengthInput, DEFAULT_CONFIG.segment_length_sec, {
+    min: 5,
+    max: 60,
+  });
+  const overlapMax = Math.max(segment - 1, 0);
+  if (overlapInput) {
+    overlapInput.max = String(overlapMax);
+  }
+  const overlap = parseNumberInput(overlapInput, DEFAULT_CONFIG.overlap_sec, {
+    min: 0,
+    max: overlapMax,
+  });
+  const threshold = parseNumberInput(
+    confidenceInput,
+    DEFAULT_CONFIG.confidence_threshold,
+    {
+      min: 0,
+      max: 1,
+    },
+  );
+
+  userConfig.segment_length_sec = segment;
+  userConfig.overlap_sec = overlap;
+  userConfig.confidence_threshold = threshold;
+  persistConfig();
+  return getEffectiveConfig();
+}
+
+function applyConfigToInputs() {
+  if (!captureSettingsForm) {
+    return;
+  }
+  const config = getEffectiveConfig();
+  if (segmentLengthInput) {
+    segmentLengthInput.value = String(config.segment_length_sec);
+  }
+  if (overlapInput) {
+    overlapInput.max = String(Math.max(config.segment_length_sec - 1, 0));
+    overlapInput.value = String(config.overlap_sec);
+  }
+  if (confidenceInput) {
+    confidenceInput.value = config.confidence_threshold.toFixed(2);
+  }
+  updateSliderDisplays(config);
+  updatePreviewToggleButton();
+  updatePreviewVisibility();
+}
+
+function updateSliderDisplays(config = getEffectiveConfig()) {
+  if (segmentLengthDisplay) {
+    segmentLengthDisplay.textContent = `${config.segment_length_sec}s`;
+  }
+  if (overlapDisplay) {
+    overlapDisplay.textContent = `${config.overlap_sec}s`;
+  }
+  if (confidenceDisplay) {
+    confidenceDisplay.textContent = config.confidence_threshold.toFixed(2);
+  }
+}
+
+function updatePreviewVisibility(stream) {
+  if (!previewVideo) {
+    return;
+  }
+  const shouldShow = Boolean(userConfig.preview_enabled) && Boolean(stream || previewVideo.srcObject);
+  if (shouldShow && stream) {
+    previewVideo.srcObject = stream;
+    previewVideo.muted = true;
+    previewVideo
+      .play()
+      .catch(() => {});
+  } else if (!shouldShow && previewVideo.srcObject) {
+    try {
+      previewVideo.pause();
+    } catch {
+      // ignore
+    }
+    previewVideo.srcObject = null;
+  }
+  previewVideo.classList.toggle("is-visible", shouldShow);
+  if (previewHelp) {
+    previewHelp.hidden = shouldShow;
+  }
+}
+
+function clearPreview() {
+  if (!previewVideo) {
+    return;
+  }
+  try {
+    previewVideo.pause();
+  } catch {
+    // ignore
+  }
+  previewVideo.srcObject = null;
+  previewVideo.classList.remove("is-visible");
+  if (previewHelp) {
+    previewHelp.hidden = false;
+  }
+}
+
+function updatePreviewToggleButton() {
+  if (!previewToggleButton) {
+    return;
+  }
+  previewToggleButton.textContent = userConfig.preview_enabled
+    ? "Disable preview"
+    : "Enable preview";
+  previewToggleButton.dataset.active = userConfig.preview_enabled ? "true" : "false";
+}
+
+function startRecordingBanner() {
+  if (!recordingBanner) {
+    return;
+  }
+  const startTime = new Date();
+  const update = () => {
+    if (!captureState.context) {
+      return;
+    }
+    const now = new Date();
+    const diffMs = now - startTime;
+    const minutes = String(Math.floor(diffMs / 60000)).padStart(2, "0");
+    const seconds = String(Math.floor((diffMs % 60000) / 1000)).padStart(2, "0");
+    const segments = captureState.context.segmentIndex;
+    recordingBanner.textContent = `Recording · ${minutes}:${seconds} elapsed · ${segments} segment${segments === 1 ? "" : "s"} uploaded`;
+    recordingBanner.dataset.active = "true";
+  };
+  update();
+  if (recordingBannerInterval) {
+    window.clearInterval(recordingBannerInterval);
+  }
+  recordingBannerInterval = window.setInterval(update, 1000);
+}
+
+function stopRecordingBanner() {
+  if (recordingBannerInterval) {
+    window.clearInterval(recordingBannerInterval);
+    recordingBannerInterval = null;
+  }
+  if (recordingBanner) {
+    recordingBanner.dataset.active = "false";
+    recordingBanner.textContent = "Recording…";
+  }
+}
+
+function renderDetectionLog() {
+  if (!detectionList) {
+    return;
+  }
+  detectionList.innerHTML = "";
+  if (!detectionLog.length) {
+    if (detectionEmptyState) {
+      detectionEmptyState.hidden = false;
+    }
+    return;
+  }
+  if (detectionEmptyState) {
+    detectionEmptyState.hidden = true;
+  }
+  for (const entry of detectionLog) {
+    const item = document.createElement("li");
+    const header = document.createElement("div");
+    header.className = "det-header";
+    const label = document.createElement("span");
+    label.textContent = entry.label;
+    const confidence = document.createElement("span");
+    confidence.textContent = entry.confidence;
+    header.append(label, confidence);
+    const meta = document.createElement("div");
+    meta.className = "det-meta";
+    meta.textContent = `${entry.time} · ${entry.model}`;
+    item.append(header, meta);
+    detectionList.append(item);
+  }
+}
+
+function appendDetectionsToLog(detections) {
+  if (!detections || !detections.length) {
+    return;
+  }
+  const mapped = detections.map((det) => {
+    const label =
+      det.detection_class ||
+      det.class ||
+      det.model_id ||
+      "Detection";
+    const confidence = typeof det.confidence === "number"
+      ? `${Math.round(det.confidence * 100)}%`
+      : "—";
+    const ts = det.timestamp ? new Date(det.timestamp) : new Date();
+    return {
+      label,
+      confidence,
+      model: det.model_id || "client",
+      time: ts.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+    };
+  });
+  detectionLog.unshift(...mapped);
+  if (detectionLog.length > 25) {
+    detectionLog.length = 25;
+  }
+  renderDetectionLog();
+}
+
+function clearDetectionLog() {
+  detectionLog.length = 0;
+  renderDetectionLog();
+}
 
 const kineticsNormalization = {
   mean: [0.43216, 0.394666, 0.37645],
@@ -181,8 +491,10 @@ async function getMobileDetections(blob, startTs, endTs, index) {
         ? runVideoInference(segmentVideo, startTs, endTs)
         : [],
     ]);
-    inference.resetSegment(endTs);
-    return [...(audioDetections || []), ...(videoDetections || [])];
+    inference.resetSegment();
+    const combined = [...(audioDetections || []), ...(videoDetections || [])];
+    appendDetectionsToLog(combined);
+    return combined;
   } catch (error) {
     console.warn("Mobile inference unavailable, skipping detections", error);
     if (captureState.inference) {
@@ -219,6 +531,8 @@ async function startSession() {
     });
     activeSession = session;
     renderActiveSession(session);
+    clearDetectionLog();
+    startRecordingBanner();
     toggleButtons(true);
     let captureError = null;
     try {
@@ -254,6 +568,7 @@ async function buildSessionPayload() {
 
   const gpsOrigin = await resolveGpsOrigin(now, defaults);
   const orientationOrigin = await resolveOrientationOrigin(now, defaults);
+  const config = updateConfigFromInputs();
 
   return {
     started_at: now.toISOString(),
@@ -264,9 +579,9 @@ async function buildSessionPayload() {
     gps_origin: gpsOrigin,
     orientation_origin: orientationOrigin,
     config_snapshot: {
-      segment_length_sec: 10,
-      overlap_sec: 5,
-      confidence_threshold: 0.1,
+      segment_length_sec: config.segment_length_sec,
+      overlap_sec: config.overlap_sec,
+      confidence_threshold: config.confidence_threshold,
     },
     detection_summary: {
       total_detections: 0,
@@ -403,6 +718,7 @@ async function startMediaCapture(session) {
       height: { ideal: 720 },
     },
   });
+  updatePreviewVisibility(stream);
   const options = resolveRecorderOptions(stream);
   const recorder = new MediaRecorder(stream, options);
   try {
@@ -435,16 +751,17 @@ async function startMediaCapture(session) {
     const start = context.segmentStart ?? new Date();
     const end = new Date();
     context.segmentStart = end;
+    const segmentIndex = context.segmentIndex;
     const uploadPromise = (async () => {
       const detections = await getMobileDetections(
         event.data,
         start,
         end,
-        context.segmentIndex,
+        segmentIndex,
       );
       return uploadSegmentBlob(
         context.sessionId,
-        context.segmentIndex,
+        segmentIndex,
         start,
         end,
         event.data,
@@ -842,6 +1159,8 @@ async function stopMediaCapture() {
   }
   stream.getTracks().forEach((track) => track.stop());
   await stopPromise;
+  clearPreview();
+  stopRecordingBanner();
 
   if (captureState.uploads.length) {
     const pending = [...captureState.uploads];
@@ -900,6 +1219,7 @@ async function stopSession() {
     renderActiveSession(session);
     toggleButtons(false);
     setStatus("Session stopped.", "success");
+    stopRecordingBanner();
     await loadSessions({ announce: false });
   } catch (error) {
     console.error("Failed to stop session", error);
@@ -986,6 +1306,9 @@ async function loadAudioModel() {
   if (inferenceState.audioModel) {
     return inferenceState.audioModel;
   }
+  if (inferenceState.audioModelPromise) {
+    return inferenceState.audioModelPromise;
+  }
   if (!inferenceState.runtimeReady || !window.tflite) {
     throw new Error("Inference runtime not ready");
   }
@@ -993,34 +1316,50 @@ async function loadAudioModel() {
     throw new Error("Audio model URL not configured");
   }
 
-  try {
-    // Load TFLite model from URL with options
-    inferenceState.audioModel = await window.tflite.loadTFLiteModel(
-      inferenceState.audioModelUrl,
-      {
-        numThreads: Math.max(navigator.hardwareConcurrency / 2 || 1, 1),
-      }
-    );
-    return inferenceState.audioModel;
-  } catch (error) {
-    console.error("Failed to load audio model from URL", error);
-    // Fallback: try loading from cache
+  const load = (async () => {
+    const threads = Math.max(navigator.hardwareConcurrency / 2 || 1, 1);
     try {
-      const buffer = await fetchModelFromCache(inferenceState.audioModelUrl);
-      inferenceState.audioModel = await window.tflite.loadTFLiteModel(buffer, {
-        numThreads: Math.max(navigator.hardwareConcurrency / 2 || 1, 1),
-      });
-      return inferenceState.audioModel;
-    } catch (fallbackError) {
-      console.error("Failed to load audio model from cache", fallbackError);
-      throw error;
+      const model = await window.tflite.loadTFLiteModel(
+        inferenceState.audioModelUrl,
+        { numThreads: threads },
+      );
+      inferenceState.audioModel = model;
+      return model;
+    } catch (primaryError) {
+      console.error("Failed to load audio model from URL", primaryError);
+      try {
+        const buffer = await fetchModelFromCache(
+          inferenceState.audioModelUrl,
+        );
+        const model = await window.tflite.loadTFLiteModel(buffer, {
+          numThreads: threads,
+        });
+        inferenceState.audioModel = model;
+        return model;
+      } catch (fallbackError) {
+        console.error("Failed to load audio model from cache", fallbackError);
+        throw fallbackError;
+      }
     }
-  }
+  })()
+    .catch((error) => {
+      inferenceState.audioModel = null;
+      throw error;
+    })
+    .finally(() => {
+      inferenceState.audioModelPromise = null;
+    });
+
+  inferenceState.audioModelPromise = load;
+  return load;
 }
 
 async function loadVideoModel() {
   if (inferenceState.videoModel) {
     return inferenceState.videoModel;
+  }
+  if (inferenceState.videoModelPromise) {
+    return inferenceState.videoModelPromise;
   }
   if (!inferenceState.runtimeReady || !window.tflite) {
     throw new Error("Inference runtime not ready");
@@ -1029,26 +1368,40 @@ async function loadVideoModel() {
     throw new Error("Video model URL not configured");
   }
 
-  const threads = Math.max(navigator.hardwareConcurrency / 2 || 1, 1);
-  try {
-    inferenceState.videoModel = await window.tflite.loadTFLiteModel(
-      inferenceState.videoModelUrl,
-      { numThreads: threads }
-    );
-    return inferenceState.videoModel;
-  } catch (error) {
-    console.error("Failed to load video model from URL", error);
+  const load = (async () => {
+    const threads = Math.max(navigator.hardwareConcurrency / 2 || 1, 1);
     try {
-      const buffer = await fetchModelFromCache(inferenceState.videoModelUrl);
-      inferenceState.videoModel = await window.tflite.loadTFLiteModel(buffer, {
-        numThreads: threads,
-      });
-      return inferenceState.videoModel;
-    } catch (fallbackError) {
-      console.error("Failed to load video model from cache", fallbackError);
-      throw error;
+      const model = await window.tflite.loadTFLiteModel(
+        inferenceState.videoModelUrl,
+        { numThreads: threads },
+      );
+      inferenceState.videoModel = model;
+      return model;
+    } catch (primaryError) {
+      console.error("Failed to load video model from URL", primaryError);
+      try {
+        const buffer = await fetchModelFromCache(inferenceState.videoModelUrl);
+        const model = await window.tflite.loadTFLiteModel(buffer, {
+          numThreads: threads,
+        });
+        inferenceState.videoModel = model;
+        return model;
+      } catch (fallbackError) {
+        console.error("Failed to load video model from cache", fallbackError);
+        throw fallbackError;
+      }
     }
-  }
+  })()
+    .catch((error) => {
+      inferenceState.videoModel = null;
+      throw error;
+    })
+    .finally(() => {
+      inferenceState.videoModelPromise = null;
+    });
+
+  inferenceState.videoModelPromise = load;
+  return load;
 }
 
 function downsampleToMono(audioBuffer, targetRate = 16000) {
@@ -1773,6 +2126,44 @@ function setupLiveUpdates() {
   startPolling();
 }
 
+if (captureSettingsForm) {
+  captureSettingsForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+  });
+  captureSettingsForm.addEventListener("input", () => {
+    const config = updateConfigFromInputs();
+    updateSliderDisplays(config);
+  });
+}
+
+if (clearDetectionsButton) {
+  clearDetectionsButton.addEventListener("click", () => {
+    clearDetectionLog();
+  });
+}
+
+if (resetConfigButton) {
+  resetConfigButton.addEventListener("click", () => {
+    Object.assign(userConfig, { ...DEFAULT_CONFIG });
+    persistConfig();
+    applyConfigToInputs();
+    setStatus("Capture settings reset to defaults.", "info");
+  });
+}
+
+if (previewToggleButton) {
+  previewToggleButton.addEventListener("click", () => {
+    userConfig.preview_enabled = !userConfig.preview_enabled;
+    persistConfig();
+    updatePreviewToggleButton();
+    if (!userConfig.preview_enabled) {
+      clearPreview();
+    } else if (captureState.context?.stream) {
+      updatePreviewVisibility(captureState.context.stream);
+    }
+  });
+}
+
 function cleanupLiveUpdates() {
   shuttingDown = true;
   stopMediaCapture().catch((error) => {
@@ -1793,6 +2184,8 @@ stopButton.addEventListener("click", stopSession);
 refreshButton.addEventListener("click", loadSessions);
 
 document.addEventListener("DOMContentLoaded", async () => {
+  applyConfigToInputs();
+  renderDetectionLog();
   setStatus("Loading sessions…");
   await loadSessions();
   setupLiveUpdates();
