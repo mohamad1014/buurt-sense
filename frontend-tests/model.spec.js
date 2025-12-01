@@ -366,10 +366,10 @@ test("detection feed surfaces segment and latency metadata", async ({ page }) =>
       timestamp: new Date().toISOString(),
       model_id: "test-model",
       segment_duration_ms: 2500,
-      inference_latency_ms: 150,
+      inference_time_ms: 150,
     };
     window.appendDetectionsToLog([detection]);
-    const meta = document.querySelector("#detection-feed .det-meta");
+    const meta = document.querySelector("#detection-feed .det-meta--stats");
     return meta?.textContent || "";
   });
   expect(metaText).toContain("2.5s segment");

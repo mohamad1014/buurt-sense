@@ -573,17 +573,18 @@ function renderDetectionLog() {
     const confidence = document.createElement("span");
     confidence.textContent = entry.confidence;
     header.append(label, confidence);
-    const meta = document.createElement("div");
-    meta.className = "det-meta";
-    const metaParts = [entry.time, entry.model];
+    const metaPrimary = document.createElement("div");
+    metaPrimary.className = "det-meta";
+    metaPrimary.textContent = `${entry.time} · ${entry.model}`;
+    const metaSecondary = document.createElement("div");
+    metaSecondary.className = "det-meta det-meta--stats";
+    const stats = [];
     if (entry.segment) {
-      metaParts.push(entry.segment);
+      stats.push(entry.segment);
     }
-    if (entry.latency) {
-      metaParts.push(entry.latency);
-    }
-    meta.textContent = metaParts.join(" · ");
-    item.append(header, meta);
+    stats.push(entry.latency || "— inference");
+    metaSecondary.textContent = stats.join(" · ");
+    item.append(header, metaPrimary, metaSecondary);
     detectionList.append(item);
   }
 }
@@ -606,8 +607,12 @@ function appendDetectionsToLog(detections) {
       detectionSegmentDurationMs(det),
       "segment",
     );
+    const latencyMs =
+      typeof det.inference_time_ms === "number"
+        ? det.inference_time_ms
+        : det.inference_latency_ms;
     const latencyLabel = formatDurationLabel(
-      det.inference_latency_ms,
+      latencyMs,
       "inference",
     );
     return {
