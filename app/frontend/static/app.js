@@ -105,6 +105,31 @@ function clamp(value, min, max) {
   return result;
 }
 
+function toTimestampMs(value) {
+  if (value instanceof Date) {
+    return value.getTime();
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value) {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+function computeSegmentDurationMs(startTs, endTs) {
+  const start = toTimestampMs(startTs);
+  const end = toTimestampMs(endTs);
+  if (typeof start === "number" && typeof end === "number") {
+    return Math.max(Math.round(end - start), 0);
+  }
+  return null;
+}
+
 function parseNumberInput(element, fallback, options = {}) {
   const raw = element?.value?.trim();
   const parsed = Number.parseFloat(raw);
@@ -289,6 +314,29 @@ function stopRecordingBanner() {
   }
 }
 
+function formatDurationLabel(valueMs, suffix) {
+  const numeric = typeof valueMs === "number" ? valueMs : Number(valueMs);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return null;
+  }
+  if (numeric >= 1000) {
+    const seconds = numeric / 1000;
+    const decimals = seconds >= 10 ? 0 : 1;
+    return `${seconds.toFixed(decimals)}s ${suffix}`;
+  }
+  return `${Math.max(Math.round(numeric), 1)}ms ${suffix}`;
+}
+
+function detectionSegmentDurationMs(det) {
+  if (typeof det?.segment_duration_ms === "number") {
+    return det.segment_duration_ms;
+  }
+  if (typeof det?.segment_length_sec === "number") {
+    return det.segment_length_sec * 1000;
+  }
+  return null;
+}
+
 function renderDetectionLog() {
   if (!detectionList) {
     return;
@@ -314,7 +362,14 @@ function renderDetectionLog() {
     header.append(label, confidence);
     const meta = document.createElement("div");
     meta.className = "det-meta";
-    meta.textContent = `${entry.time} · ${entry.model}`;
+    const metaParts = [entry.time, entry.model];
+    if (entry.segment) {
+      metaParts.push(entry.segment);
+    }
+    if (entry.latency) {
+      metaParts.push(entry.latency);
+    }
+    meta.textContent = metaParts.join(" · ");
     item.append(header, meta);
     detectionList.append(item);
   }
@@ -334,11 +389,21 @@ function appendDetectionsToLog(detections) {
       ? `${Math.round(det.confidence * 100)}%`
       : "—";
     const ts = det.timestamp ? new Date(det.timestamp) : new Date();
+    const segmentLabel = formatDurationLabel(
+      detectionSegmentDurationMs(det),
+      "segment",
+    );
+    const latencyLabel = formatDurationLabel(
+      det.inference_latency_ms,
+      "inference",
+    );
     return {
       label,
       confidence,
       model: det.model_id || "client",
       time: ts.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+      segment: segmentLabel,
+      latency: latencyLabel,
     };
   });
   detectionLog.unshift(...mapped);
@@ -485,7 +550,12 @@ async function getMobileDetections(blob, startTs, endTs, index) {
     const segmentVideo = inference.consumeVideoFrames();
     const [audioDetections, videoDetections] = await Promise.all([
       segmentAudio
-        ? runAudioInference(segmentAudio.pcm, segmentAudio.sampleRate, endTs)
+        ? runAudioInference(
+            segmentAudio.pcm,
+            segmentAudio.sampleRate,
+            startTs,
+            endTs,
+          )
         : [],
       segmentVideo?.frameCount
         ? runVideoInference(segmentVideo, startTs, endTs)
@@ -1445,27 +1515,44 @@ function downsamplePcm(samples, sourceRate, targetRate = 16000) {
   return result;
 }
 
-async function runAudioInference(audioInput, sampleRate, endTs) {
+async function runAudioInference(audioInput, sampleRate, startTs, endTs) {
   try {
     const model = await loadAudioModel();
+    let resolvedEndTs =
+      endTs instanceof Date
+        ? endTs
+        : endTs
+          ? new Date(endTs)
+          : new Date();
+    if (Number.isNaN(resolvedEndTs.getTime())) {
+      resolvedEndTs = new Date();
+    }
+    let segmentDurationMs = computeSegmentDurationMs(startTs, resolvedEndTs);
+    const targetRate = 16000;
     let mono = new Float32Array();
     if (audioInput instanceof Blob) {
       const arrayBuffer = await audioInput.arrayBuffer();
       const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       const decoded = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
-      mono = downsampleToMono(decoded, 16000);
+      mono = downsampleToMono(decoded, targetRate);
     } else if (audioInput instanceof Float32Array || Array.isArray(audioInput)) {
       const rate = sampleRate || 48000;
-      mono = downsamplePcm(audioInput, rate, 16000);
+      mono = downsamplePcm(audioInput, rate, targetRate);
     } else if (audioInput?.pcm) {
       const rate = audioInput.sampleRate || sampleRate || 48000;
-      mono = downsamplePcm(audioInput.pcm, rate, 16000);
+      mono = downsamplePcm(audioInput.pcm, rate, targetRate);
     } else {
       console.warn("Audio inference input missing");
       return [];
     }
     if (!mono.length) {
       return [];
+    }
+    if (!segmentDurationMs) {
+      const estimatedMs = (mono.length / targetRate) * 1000;
+      if (Number.isFinite(estimatedMs) && estimatedMs > 0) {
+        segmentDurationMs = Math.max(Math.round(estimatedMs), 1);
+      }
     }
 
     const start = performance.now();
@@ -1492,7 +1579,7 @@ async function runAudioInference(audioInput, sampleRate, endTs) {
     const melMatrix = buildMelFilterbank(
       numMelBins,
       fftLength / 2 + 1,
-      16000,
+      targetRate,
       lowerEdgeHz,
       upperEdgeHz
     );
@@ -1584,9 +1671,10 @@ async function runAudioInference(audioInput, sampleRate, endTs) {
       {
         class: label,
         confidence,
-        timestamp: endTs.toISOString(),
+        timestamp: resolvedEndTs.toISOString(),
         model_id: inferenceState.audioModelId,
         inference_latency_ms: latencyMs,
+        segment_duration_ms: segmentDurationMs ?? null,
         origin: "client",
       },
     ];
@@ -1602,20 +1690,45 @@ async function runVideoInference(videoSource, startTs, endTs) {
     const inputSize = Math.max(inferenceState.videoInputSize, 1);
     const expectedFrameCount = Math.max(inferenceState.videoFrameCount, 1);
     const frameSize = inputSize * inputSize * 3;
+    let resolvedEndTs =
+      endTs instanceof Date
+        ? endTs
+        : endTs
+          ? new Date(endTs)
+          : new Date();
+    if (Number.isNaN(resolvedEndTs.getTime())) {
+      resolvedEndTs = new Date();
+    }
+    let segmentDurationMs = computeSegmentDurationMs(startTs, resolvedEndTs);
+    const fallbackDurationSec = (() => {
+      if (segmentDurationMs && segmentDurationMs > 0) {
+        return Math.max(segmentDurationMs / 1000, 0.001);
+      }
+      if (typeof videoSource?.durationSec === "number") {
+        return Math.max(videoSource.durationSec, 0.001);
+      }
+      if (typeof videoSource?.duration_ms === "number") {
+        return Math.max(videoSource.duration_ms / 1000, 0.001);
+      }
+      return 1;
+    })();
     let frames = null;
     if (videoSource?.data && videoSource.frameCount) {
       frames = videoSource;
     } else if (videoSource instanceof Blob) {
-      const fallbackDurationSec = Math.max(
-        (endTs.getTime() - startTs.getTime()) / 1000,
-        0.001,
-      );
       frames = await sampleVideoFrames(
         videoSource,
         expectedFrameCount,
         inputSize,
         fallbackDurationSec,
       );
+      if (
+        !segmentDurationMs &&
+        typeof frames?.durationSec === "number" &&
+        Number.isFinite(frames.durationSec)
+      ) {
+        segmentDurationMs = Math.max(Math.round(frames.durationSec * 1000), 1);
+      }
     } else {
       console.warn("Video inference source missing; skipping video inference");
       return [];
@@ -1703,14 +1816,16 @@ async function runVideoInference(videoSource, startTs, endTs) {
 
     const latencyMs = Math.max(Math.round(performance.now() - start), 1);
     const confidence = Math.max(Math.min(maxProb, 1), 0);
+    const fallbackDurationMs = Math.max(Math.round(fallbackDurationSec * 1000), 1);
 
     return [
       {
         class: label,
         confidence,
-        timestamp: endTs.toISOString(),
+        timestamp: resolvedEndTs.toISOString(),
         model_id: inferenceState.videoModelId,
         inference_latency_ms: latencyMs,
+        segment_duration_ms: segmentDurationMs ?? fallbackDurationMs,
         origin: "client",
       },
     ];
@@ -1804,7 +1919,7 @@ async function sampleVideoFrames(blob, frameCount, targetSize, fallbackDurationS
       normalizeFrame(pixels, frames, offset);
     }
 
-    return { data: frames, frameCount };
+    return { data: frames, frameCount, durationSec: safeDuration };
   } finally {
     URL.revokeObjectURL(url);
     video.src = "";
