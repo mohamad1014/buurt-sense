@@ -1302,6 +1302,26 @@ async function ensureInferenceRuntime() {
   }
 }
 
+async function preloadInferenceResources() {
+  try {
+    await ensureInferenceRuntime();
+  } catch (error) {
+    console.warn("Inference runtime preload failed", error);
+    return;
+  }
+
+  const [audioLoad, videoLoad] = await Promise.allSettled([
+    loadAudioModel(),
+    loadVideoModel(),
+  ]);
+  if (audioLoad.status === "rejected") {
+    console.warn("Audio model preload failed", audioLoad.reason);
+  }
+  if (videoLoad.status === "rejected") {
+    console.warn("Video model preload failed", videoLoad.reason);
+  }
+}
+
 async function loadAudioModel() {
   if (inferenceState.audioModel) {
     return inferenceState.audioModel;
@@ -2184,6 +2204,7 @@ stopButton.addEventListener("click", stopSession);
 refreshButton.addEventListener("click", loadSessions);
 
 document.addEventListener("DOMContentLoaded", async () => {
+  preloadInferenceResources();
   applyConfigToInputs();
   renderDetectionLog();
   setStatus("Loading sessions…");
