@@ -5,6 +5,8 @@ const refreshButton = document.getElementById("refresh-sessions");
 const activeSessionDetails = document.getElementById("active-session-details");
 const sessionList = document.getElementById("session-list");
 const captureSettingsForm = document.getElementById("capture-settings-form");
+const audioInferenceToggle = document.getElementById("config-audio-inference");
+const videoInferenceToggle = document.getElementById("config-video-inference");
 const segmentLengthInput = document.getElementById("config-segment-length");
 const overlapInput = document.getElementById("config-overlap");
 const confidenceInput = document.getElementById("config-confidence");
@@ -63,11 +65,206 @@ const inferenceState = {
   videoInputSize: 112,
 };
 
+class InferenceWorkerBridge {
+  constructor(config) {
+    this.config = config;
+    this.worker = null;
+    this.requests = new Map();
+    this.nextId = 1;
+    this.initPromise = null;
+  }
+
+  ensureWorker() {
+    if (this.worker) {
+      return this.initPromise;
+    }
+    try {
+      this.worker = new Worker("/static/inference.worker.js");
+    } catch (error) {
+      console.warn("Inference worker unavailable; falling back to no-op", error);
+      return Promise.reject(error);
+    }
+    this.worker.onmessage = (event) => {
+      const message = event.data || {};
+      const pending = this.requests.get(message.id);
+      if (!pending) {
+        return;
+      }
+      this.requests.delete(message.id);
+      if (message.success) {
+        pending.resolve(message.result);
+      } else {
+        pending.reject(new Error(message.error || "Inference worker error"));
+      }
+    };
+    this.worker.onerror = (event) => {
+      console.error("Inference worker error", event);
+    };
+    this.initPromise = this.postMessage("INIT", this.config);
+    return this.initPromise;
+  }
+
+  async postMessage(type, payload = null, transfer = []) {
+    if (!this.worker) {
+      await this.ensureWorker();
+    }
+    await this.initPromise;
+    const id = this.nextId++;
+    const promise = new Promise((resolve, reject) => {
+      this.requests.set(id, { resolve, reject });
+    });
+    try {
+      this.worker.postMessage({ id, type, payload }, transfer);
+    } catch (error) {
+      this.requests.delete(id);
+      throw error;
+    }
+    return promise;
+  }
+
+  preload() {
+    return this.postMessage("PRELOAD");
+  }
+
+  runDetections(payload, transfer = []) {
+    return this.postMessage("RUN_DETECTIONS", payload, transfer);
+  }
+
+  terminate() {
+    if (this.worker) {
+      this.worker.terminate();
+      this.worker = null;
+    }
+    this.requests.clear();
+    this.nextId = 1;
+    this.initPromise = null;
+  }
+}
+
+let inferenceWorkerBridge = null;
+
+function getInferenceWorkerBridge() {
+  if (!inferenceWorkerBridge) {
+    inferenceWorkerBridge = new InferenceWorkerBridge({
+      audioModelUrl: inferenceState.audioModelUrl,
+      videoModelUrl: inferenceState.videoModelUrl,
+      audioModelId: inferenceState.audioModelId,
+      videoModelId: inferenceState.videoModelId,
+      wasmBaseUrl: inferenceState.wasmBaseUrl,
+      classMapUrl: inferenceState.classMapUrl,
+      videoClassMapUrl: inferenceState.videoClassMapUrl,
+      videoFrameCount: inferenceState.videoFrameCount,
+      videoInputSize: inferenceState.videoInputSize,
+    });
+  }
+  return inferenceWorkerBridge;
+}
+
+function preloadInferenceResources() {
+  try {
+    const worker = getInferenceWorkerBridge();
+    worker.preload().catch((error) => {
+      console.warn("Inference worker preload failed", error);
+    });
+  } catch (error) {
+    console.warn("Inference worker unavailable", error);
+  }
+}
+
+async function ensureInferenceRuntime() {
+  try {
+    await getInferenceWorkerBridge().preload();
+  } catch (error) {
+    console.warn("Inference runtime preload failed", error);
+  }
+}
+
+async function prepareAudioInputForWorker(audioInput, sampleRate) {
+  if (!audioInput) {
+    return null;
+  }
+  if (audioInput instanceof Float32Array) {
+    return { pcm: audioInput, sampleRate: sampleRate || 48000 };
+  }
+  if (Array.isArray(audioInput)) {
+    return { pcm: Float32Array.from(audioInput), sampleRate: sampleRate || 48000 };
+  }
+  if (audioInput?.pcm instanceof Float32Array) {
+    return {
+      pcm: audioInput.pcm,
+      sampleRate: audioInput.sampleRate || sampleRate || 48000,
+    };
+  }
+  if (audioInput instanceof Blob) {
+    const arrayBuffer = await audioInput.arrayBuffer();
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) {
+      return null;
+    }
+    const audioCtx = new AudioCtx();
+    try {
+      const decoded = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+      const channel = decoded.getChannelData(0);
+      const pcm = new Float32Array(channel.length);
+      pcm.set(channel);
+      return { pcm, sampleRate: decoded.sampleRate };
+    } finally {
+      audioCtx.close().catch(() => {});
+    }
+  }
+  return null;
+}
+
+async function runAudioInference(audioInput, sampleRate, startTs, endTs) {
+  const prepared = await prepareAudioInputForWorker(audioInput, sampleRate);
+  if (!prepared) {
+    return [];
+  }
+  const start = startTs instanceof Date ? startTs : new Date(startTs || Date.now());
+  const end = endTs instanceof Date ? endTs : new Date(endTs || Date.now());
+  const payload = {
+    audio: {
+      pcm: prepared.pcm.buffer.slice(0),
+      sampleRate: prepared.sampleRate,
+      startTs: start.toISOString(),
+      endTs: end.toISOString(),
+      segmentDurationMs: computeSegmentDurationMs(start, end),
+    },
+  };
+  const detections = await getInferenceWorkerBridge().runDetections(payload, [payload.audio.pcm]);
+  return Array.isArray(detections) ? detections : [];
+}
+
+async function runVideoInference(videoSource, startTs, endTs) {
+  if (!videoSource?.data) {
+    return [];
+  }
+  const frames = videoSource.data instanceof Float32Array
+    ? videoSource.data
+    : new Float32Array(videoSource.data);
+  const start = startTs instanceof Date ? startTs : new Date(startTs || Date.now());
+  const end = endTs instanceof Date ? endTs : new Date(endTs || Date.now());
+  const payload = {
+    video: {
+      frames: frames.buffer.slice(0),
+      frameCount: videoSource.frameCount || inferenceState.videoFrameCount,
+      inputSize: inferenceState.videoInputSize,
+      startTs: start.toISOString(),
+      endTs: end.toISOString(),
+      segmentDurationMs: computeSegmentDurationMs(start, end),
+    },
+  };
+  const detections = await getInferenceWorkerBridge().runDetections(payload, [payload.video.frames]);
+  return Array.isArray(detections) ? detections : [];
+}
+
 const DEFAULT_CONFIG = {
   segment_length_sec: 10,
   overlap_sec: 5,
   confidence_threshold: 0.1,
   preview_enabled: false,
+  audio_inference_enabled: true,
+  video_inference_enabled: true,
 };
 
 function loadStoredConfig() {
@@ -105,6 +302,31 @@ function clamp(value, min, max) {
   return result;
 }
 
+function toTimestampMs(value) {
+  if (value instanceof Date) {
+    return value.getTime();
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value) {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+function computeSegmentDurationMs(startTs, endTs) {
+  const start = toTimestampMs(startTs);
+  const end = toTimestampMs(endTs);
+  if (typeof start === "number" && typeof end === "number") {
+    return Math.max(Math.round(end - start), 0);
+  }
+  return null;
+}
+
 function parseNumberInput(element, fallback, options = {}) {
   const raw = element?.value?.trim();
   const parsed = Number.parseFloat(raw);
@@ -131,11 +353,15 @@ function getEffectiveConfig() {
     1,
   );
   const preview = Boolean(userConfig.preview_enabled);
+  const audioInference = userConfig.audio_inference_enabled ?? DEFAULT_CONFIG.audio_inference_enabled;
+  const videoInference = userConfig.video_inference_enabled ?? DEFAULT_CONFIG.video_inference_enabled;
   return {
     segment_length_sec: segment,
     overlap_sec: overlap,
     confidence_threshold: threshold,
     preview_enabled: preview,
+    audio_inference_enabled: Boolean(audioInference),
+    video_inference_enabled: Boolean(videoInference),
   };
 }
 
@@ -167,6 +393,12 @@ function updateConfigFromInputs() {
   userConfig.segment_length_sec = segment;
   userConfig.overlap_sec = overlap;
   userConfig.confidence_threshold = threshold;
+  if (audioInferenceToggle) {
+    userConfig.audio_inference_enabled = Boolean(audioInferenceToggle.checked);
+  }
+  if (videoInferenceToggle) {
+    userConfig.video_inference_enabled = Boolean(videoInferenceToggle.checked);
+  }
   persistConfig();
   return getEffectiveConfig();
 }
@@ -185,6 +417,12 @@ function applyConfigToInputs() {
   }
   if (confidenceInput) {
     confidenceInput.value = config.confidence_threshold.toFixed(2);
+  }
+  if (audioInferenceToggle) {
+    audioInferenceToggle.checked = Boolean(config.audio_inference_enabled);
+  }
+  if (videoInferenceToggle) {
+    videoInferenceToggle.checked = Boolean(config.video_inference_enabled);
   }
   updateSliderDisplays(config);
   updatePreviewToggleButton();
@@ -289,6 +527,29 @@ function stopRecordingBanner() {
   }
 }
 
+function formatDurationLabel(valueMs, suffix) {
+  const numeric = typeof valueMs === "number" ? valueMs : Number(valueMs);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return null;
+  }
+  if (numeric >= 1000) {
+    const seconds = numeric / 1000;
+    const decimals = seconds >= 10 ? 0 : 1;
+    return `${seconds.toFixed(decimals)}s ${suffix}`;
+  }
+  return `${Math.max(Math.round(numeric), 1)}ms ${suffix}`;
+}
+
+function detectionSegmentDurationMs(det) {
+  if (typeof det?.segment_duration_ms === "number") {
+    return det.segment_duration_ms;
+  }
+  if (typeof det?.segment_length_sec === "number") {
+    return det.segment_length_sec * 1000;
+  }
+  return null;
+}
+
 function renderDetectionLog() {
   if (!detectionList) {
     return;
@@ -312,10 +573,18 @@ function renderDetectionLog() {
     const confidence = document.createElement("span");
     confidence.textContent = entry.confidence;
     header.append(label, confidence);
-    const meta = document.createElement("div");
-    meta.className = "det-meta";
-    meta.textContent = `${entry.time} · ${entry.model}`;
-    item.append(header, meta);
+    const metaPrimary = document.createElement("div");
+    metaPrimary.className = "det-meta";
+    metaPrimary.textContent = `${entry.time} · ${entry.model}`;
+    const metaSecondary = document.createElement("div");
+    metaSecondary.className = "det-meta det-meta--stats";
+    const stats = [];
+    if (entry.segment) {
+      stats.push(entry.segment);
+    }
+    stats.push(entry.latency || "— inference");
+    metaSecondary.textContent = stats.join(" · ");
+    item.append(header, metaPrimary, metaSecondary);
     detectionList.append(item);
   }
 }
@@ -334,11 +603,25 @@ function appendDetectionsToLog(detections) {
       ? `${Math.round(det.confidence * 100)}%`
       : "—";
     const ts = det.timestamp ? new Date(det.timestamp) : new Date();
+    const segmentLabel = formatDurationLabel(
+      detectionSegmentDurationMs(det),
+      "segment",
+    );
+    const latencyMs =
+      typeof det.inference_time_ms === "number"
+        ? det.inference_time_ms
+        : det.inference_latency_ms;
+    const latencyLabel = formatDurationLabel(
+      latencyMs,
+      "inference",
+    );
     return {
       label,
       confidence,
       model: det.model_id || "client",
       time: ts.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+      segment: segmentLabel,
+      latency: latencyLabel,
     };
   });
   detectionLog.unshift(...mapped);
@@ -475,24 +758,51 @@ async function fetchJson(url, options) {
 
 async function getMobileDetections(blob, startTs, endTs, index) {
   try {
-    await ensureInferenceRuntime();
     const inference = captureState.inference;
     if (!inference) {
       console.warn("Inference pipeline missing; skipping detections");
       return [];
     }
-    const segmentAudio = inference.consumeAudioSegment();
-    const segmentVideo = inference.consumeVideoFrames();
-    const [audioDetections, videoDetections] = await Promise.all([
-      segmentAudio
-        ? runAudioInference(segmentAudio.pcm, segmentAudio.sampleRate, endTs)
-        : [],
-      segmentVideo?.frameCount
-        ? runVideoInference(segmentVideo, startTs, endTs)
-        : [],
-    ]);
+    const config = getEffectiveConfig();
+    const segmentAudio = config.audio_inference_enabled
+      ? inference.consumeAudioSegment()
+      : null;
+    const segmentVideo = config.video_inference_enabled
+      ? inference.consumeVideoFrames()
+      : null;
+    const worker = getInferenceWorkerBridge();
+    const payload = {
+      audio: segmentAudio
+        ? {
+            pcm: segmentAudio.pcm.buffer,
+            sampleRate: segmentAudio.sampleRate,
+            startTs: startTs.toISOString(),
+            endTs: endTs.toISOString(),
+            segmentDurationMs: computeSegmentDurationMs(startTs, endTs),
+          }
+        : null,
+      video: segmentVideo
+        ? {
+            frames: segmentVideo.data.buffer,
+            frameCount: segmentVideo.frameCount,
+            inputSize: inferenceState.videoInputSize,
+            startTs: startTs.toISOString(),
+            endTs: endTs.toISOString(),
+            segmentDurationMs: computeSegmentDurationMs(startTs, endTs),
+          }
+        : null,
+      index,
+    };
+    const transfer = [];
+    if (payload.audio?.pcm) {
+      transfer.push(payload.audio.pcm);
+    }
+    if (payload.video?.frames) {
+      transfer.push(payload.video.frames);
+    }
+    const detections = await worker.runDetections(payload, transfer);
     inference.resetSegment();
-    const combined = [...(audioDetections || []), ...(videoDetections || [])];
+    const combined = Array.isArray(detections) ? detections : [];
     appendDetectionsToLog(combined);
     return combined;
   } catch (error) {
@@ -914,7 +1224,11 @@ async function startLiveInference(stream, segmentLengthMs) {
   let audioEnabled = Boolean(audioTrack);
   let videoEnabled = Boolean(videoTrack);
 
-  if (audioTrack) {
+  const inferenceConfig = getEffectiveConfig();
+  const allowAudioInference = Boolean(inferenceConfig.audio_inference_enabled);
+  const allowVideoInference = Boolean(inferenceConfig.video_inference_enabled);
+
+  if (audioTrack && allowAudioInference) {
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     buffers.setAudioSampleRate(audioCtx.sampleRate);
     const source = audioCtx.createMediaStreamSource(new MediaStream([audioTrack]));
@@ -982,7 +1296,7 @@ registerProcessor("capture-processor", CaptureProcessor);
     }
   }
 
-  if (videoTrack) {
+  if (videoTrack && allowVideoInference) {
     const targetSize = Math.max(inferenceState.videoInputSize, 1);
     const frameIntervalMs = Math.max(
       segmentLengthMs / Math.max(inferenceState.videoFrameCount, 1),
@@ -1247,594 +1561,6 @@ function startPolling() {
   }, 10000);
 }
 
-async function ensureInferenceRuntime() {
-  if (inferenceState.runtimeReady) {
-    return;
-  }
-  if (inferenceState.loading) {
-    // Wait for another caller to finish loading.
-    while (inferenceState.loading) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    return;
-  }
-
-  inferenceState.loading = true;
-  try {
-    // Load full TensorFlow.js bundle (includes CPU backend)
-    if (!window.tf) {
-      const tfUrls = [
-        `${inferenceState.wasmBaseUrl}/tf.min.js`,
-        "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js",
-        "https://unpkg.com/@tensorflow/tfjs@4.20.0/dist/tf.min.js",
-      ];
-      await loadScriptWithFallback(tfUrls);
-    }
-
-    if (window.tf?.setBackend) {
-      await window.tf.setBackend("cpu");
-      await window.tf.ready();
-    }
-
-    // Load TFLite plugin from self-hosted assets to avoid CDN missing WASM glue.
-    if (!window.tflite) {
-      const base = inferenceState.wasmBaseUrl;
-      await loadScriptWithFallback([`${base}/tf-tflite.min.js`]);
-      await loadScriptWithFallback([`${base}/tflite_web_api_cc_simd.js`]);
-      if (window.tflite && window.tflite.setWasmPath) {
-        window.tflite.setWasmPath(`${base}/`);
-      }
-    }
-
-    if (!inferenceState.classMap.length) {
-      inferenceState.classMap = await loadClassMap();
-    }
-    if (!inferenceState.videoClassMap.length) {
-      inferenceState.videoClassMap = await loadVideoClassMap();
-    }
-
-    inferenceState.runtimeReady = Boolean(window.tf && window.tflite);
-    if (!inferenceState.runtimeReady) {
-      throw new Error("Inference runtime failed to initialize. TF: " + Boolean(window.tf) + ", TFLite: " + Boolean(window.tflite));
-    }
-  } finally {
-    inferenceState.loading = false;
-  }
-}
-
-async function loadAudioModel() {
-  if (inferenceState.audioModel) {
-    return inferenceState.audioModel;
-  }
-  if (inferenceState.audioModelPromise) {
-    return inferenceState.audioModelPromise;
-  }
-  if (!inferenceState.runtimeReady || !window.tflite) {
-    throw new Error("Inference runtime not ready");
-  }
-  if (!inferenceState.audioModelUrl) {
-    throw new Error("Audio model URL not configured");
-  }
-
-  const load = (async () => {
-    const threads = Math.max(navigator.hardwareConcurrency / 2 || 1, 1);
-    try {
-      const model = await window.tflite.loadTFLiteModel(
-        inferenceState.audioModelUrl,
-        { numThreads: threads },
-      );
-      inferenceState.audioModel = model;
-      return model;
-    } catch (primaryError) {
-      console.error("Failed to load audio model from URL", primaryError);
-      try {
-        const buffer = await fetchModelFromCache(
-          inferenceState.audioModelUrl,
-        );
-        const model = await window.tflite.loadTFLiteModel(buffer, {
-          numThreads: threads,
-        });
-        inferenceState.audioModel = model;
-        return model;
-      } catch (fallbackError) {
-        console.error("Failed to load audio model from cache", fallbackError);
-        throw fallbackError;
-      }
-    }
-  })()
-    .catch((error) => {
-      inferenceState.audioModel = null;
-      throw error;
-    })
-    .finally(() => {
-      inferenceState.audioModelPromise = null;
-    });
-
-  inferenceState.audioModelPromise = load;
-  return load;
-}
-
-async function loadVideoModel() {
-  if (inferenceState.videoModel) {
-    return inferenceState.videoModel;
-  }
-  if (inferenceState.videoModelPromise) {
-    return inferenceState.videoModelPromise;
-  }
-  if (!inferenceState.runtimeReady || !window.tflite) {
-    throw new Error("Inference runtime not ready");
-  }
-  if (!inferenceState.videoModelUrl) {
-    throw new Error("Video model URL not configured");
-  }
-
-  const load = (async () => {
-    const threads = Math.max(navigator.hardwareConcurrency / 2 || 1, 1);
-    try {
-      const model = await window.tflite.loadTFLiteModel(
-        inferenceState.videoModelUrl,
-        { numThreads: threads },
-      );
-      inferenceState.videoModel = model;
-      return model;
-    } catch (primaryError) {
-      console.error("Failed to load video model from URL", primaryError);
-      try {
-        const buffer = await fetchModelFromCache(inferenceState.videoModelUrl);
-        const model = await window.tflite.loadTFLiteModel(buffer, {
-          numThreads: threads,
-        });
-        inferenceState.videoModel = model;
-        return model;
-      } catch (fallbackError) {
-        console.error("Failed to load video model from cache", fallbackError);
-        throw fallbackError;
-      }
-    }
-  })()
-    .catch((error) => {
-      inferenceState.videoModel = null;
-      throw error;
-    })
-    .finally(() => {
-      inferenceState.videoModelPromise = null;
-    });
-
-  inferenceState.videoModelPromise = load;
-  return load;
-}
-
-function downsampleToMono(audioBuffer, targetRate = 16000) {
-  const channelData = audioBuffer.getChannelData(0);
-  return downsamplePcm(channelData, audioBuffer.sampleRate, targetRate);
-}
-
-function downsamplePcm(samples, sourceRate, targetRate = 16000) {
-  if (!samples || !samples.length || !sourceRate) {
-    return new Float32Array();
-  }
-  if (sourceRate === targetRate) {
-    return samples.slice ? samples.slice() : new Float32Array(samples);
-  }
-  const ratio = sourceRate / targetRate;
-  const newLength = Math.floor(samples.length / ratio);
-  const result = new Float32Array(newLength);
-  for (let i = 0; i < newLength; i++) {
-    result[i] = samples[Math.floor(i * ratio)];
-  }
-  return result;
-}
-
-async function runAudioInference(audioInput, sampleRate, endTs) {
-  try {
-    const model = await loadAudioModel();
-    let mono = new Float32Array();
-    if (audioInput instanceof Blob) {
-      const arrayBuffer = await audioInput.arrayBuffer();
-      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      const decoded = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
-      mono = downsampleToMono(decoded, 16000);
-    } else if (audioInput instanceof Float32Array || Array.isArray(audioInput)) {
-      const rate = sampleRate || 48000;
-      mono = downsamplePcm(audioInput, rate, 16000);
-    } else if (audioInput?.pcm) {
-      const rate = audioInput.sampleRate || sampleRate || 48000;
-      mono = downsamplePcm(audioInput.pcm, rate, 16000);
-    } else {
-      console.warn("Audio inference input missing");
-      return [];
-    }
-    if (!mono.length) {
-      return [];
-    }
-
-    const start = performance.now();
-    // Compute log-mel spectrogram patches
-    const waveform = window.tf.tensor1d(mono);
-    const frameLength = 400; // 25ms
-    const frameStep = 160; // 10ms
-    const fftLength = 512;
-    const numMelBins = 64;
-    const patchFrames = 96; // ~0.96s
-    const patchHop = 48; // ~0.48s
-    const lowerEdgeHz = 125;
-    const upperEdgeHz = 7500;
-
-    const stft = window.tf.signal.stft(
-      waveform,
-      frameLength,
-      frameStep,
-      fftLength,
-      () => window.tf.signal.hannWindow(frameLength)
-    );
-    const magnitude = window.tf.abs(stft);
-    const powerSpec = window.tf.square(magnitude);
-    const melMatrix = buildMelFilterbank(
-      numMelBins,
-      fftLength / 2 + 1,
-      16000,
-      lowerEdgeHz,
-      upperEdgeHz
-    );
-    const melSpec = window.tf.matMul(powerSpec, melMatrix, false, true);
-    const logMelSpec = window.tf.log(melSpec.add(1e-6));
-
-    // Frame into patches; pad time axis if needed to meet patchFrames length.
-    const timeSteps = logMelSpec.shape[0] || 0;
-    const padFrames = Math.max(patchFrames - timeSteps, 0);
-    let framedInput = logMelSpec;
-    let disposeFramedInput = false;
-    if (padFrames > 0) {
-      framedInput = window.tf.pad(logMelSpec, [
-        [0, padFrames],
-        [0, 0],
-      ]);
-      disposeFramedInput = true;
-    }
-
-    const safeHop = Math.max(patchHop, 1);
-    const slices = [];
-    for (let start = 0; start + patchFrames <= framedInput.shape[0]; start += safeHop) {
-      slices.push(framedInput.slice([start, 0], [patchFrames, numMelBins]));
-    }
-    if (!slices.length) {
-      if (disposeFramedInput) {
-        framedInput.dispose();
-      }
-      waveform.dispose();
-      stft.dispose();
-      magnitude.dispose();
-      powerSpec.dispose();
-      melMatrix.dispose();
-      melSpec.dispose();
-      logMelSpec.dispose();
-      return [];
-    }
-
-    const patches = window.tf.stack(slices); // [numPatches, patchFrames, numMelBins]
-    const numPatches = patches.shape[0];
-    // YamNet expects batch=1; average patches to a single patch.
-    const mergedPatch = patches.mean(0); // [patchFrames, numMelBins]
-    const inputTensor = mergedPatch.reshape([1, 1, patchFrames, numMelBins]);
-
-    let output;
-    try {
-      output = model.predict(inputTensor);
-    } finally {
-      inputTensor.dispose();
-      waveform.dispose();
-      stft.dispose();
-      magnitude.dispose();
-      powerSpec.dispose();
-      melMatrix.dispose();
-      melSpec.dispose();
-      logMelSpec.dispose();
-      if (disposeFramedInput) {
-        framedInput.dispose();
-      }
-      patches.dispose();
-      mergedPatch.dispose();
-      slices.forEach((s) => s.dispose());
-    }
-
-    const logits = await output.data();
-    if (output.dispose) {
-      output.dispose();
-    }
-    if (!logits || logits.length === 0) {
-      return [];
-    }
-
-    // Average logits across patches, then softmax
-    const numClasses = logits.length / numPatches;
-    const classTotals = new Float32Array(numClasses);
-    for (let i = 0; i < logits.length; i++) {
-      classTotals[i % numClasses] += logits[i];
-    }
-    const avgLogits = Array.from(classTotals).map((v) => v / numPatches);
-    const { maxIdx, maxProb } = softmaxTop1(avgLogits);
-
-    const latencyMs = Math.max(Math.round(performance.now() - start), 1);
-    const confidence = Math.max(Math.min(maxProb, 1), 0);
-    const label =
-      inferenceState.classMap[maxIdx] ||
-      `audio_class_${maxIdx}`;
-
-    return [
-      {
-        class: label,
-        confidence,
-        timestamp: endTs.toISOString(),
-        model_id: inferenceState.audioModelId,
-        inference_latency_ms: latencyMs,
-        origin: "client",
-      },
-    ];
-  } catch (error) {
-    console.error("Audio inference failed", error);
-    return [];
-  }
-}
-
-async function runVideoInference(videoSource, startTs, endTs) {
-  try {
-    const model = await loadVideoModel();
-    const inputSize = Math.max(inferenceState.videoInputSize, 1);
-    const expectedFrameCount = Math.max(inferenceState.videoFrameCount, 1);
-    const frameSize = inputSize * inputSize * 3;
-    let frames = null;
-    if (videoSource?.data && videoSource.frameCount) {
-      frames = videoSource;
-    } else if (videoSource instanceof Blob) {
-      const fallbackDurationSec = Math.max(
-        (endTs.getTime() - startTs.getTime()) / 1000,
-        0.001,
-      );
-      frames = await sampleVideoFrames(
-        videoSource,
-        expectedFrameCount,
-        inputSize,
-        fallbackDurationSec,
-      );
-    } else {
-      console.warn("Video inference source missing; skipping video inference");
-      return [];
-    }
-    if (!frames || !frames.data || !frames.frameCount) {
-      return [];
-    }
-    let frameCount = Math.max(frames.frameCount, 1);
-    let frameData = frames.data;
-    const expectedLength = expectedFrameCount * frameSize;
-    const availableLength = frameData.length;
-    if (frameCount < expectedFrameCount && availableLength >= frameSize) {
-      const padded = new Float32Array(expectedLength);
-      const copyCount = Math.min(frameCount, expectedFrameCount);
-      for (let i = 0; i < copyCount; i++) {
-        padded.set(
-          frameData.subarray(i * frameSize, (i + 1) * frameSize),
-          i * frameSize,
-        );
-      }
-      const repeatStart = Math.max(copyCount - 1, 0) * frameSize;
-      const repeatSlice = frameData.subarray(
-        repeatStart,
-        repeatStart + frameSize,
-      );
-      for (let i = copyCount; i < expectedFrameCount; i++) {
-        padded.set(repeatSlice, i * frameSize);
-      }
-      frameData = padded;
-      frameCount = expectedFrameCount;
-    } else if (frameCount > expectedFrameCount && availableLength >= expectedLength) {
-      const startIndex = frameCount - expectedFrameCount;
-      frameData = frameData.subarray(
-        startIndex * frameSize,
-        startIndex * frameSize + expectedLength,
-      );
-      frameCount = expectedFrameCount;
-    } else if (frameData.length < frameCount * frameSize) {
-      console.warn("Video inference frame data incomplete; skipping video inference");
-      return [];
-    }
-
-    const inputTensor = window.tf.tensor(
-      frameData,
-      [1, frameCount, inputSize, inputSize, 3],
-      "float32",
-    );
-
-    const start = performance.now();
-    let output;
-    try {
-      output = model.predict(inputTensor);
-    } finally {
-      inputTensor.dispose();
-    }
-
-    let logits;
-    if (output?.dataSync) {
-      logits = output.dataSync();
-    } else if (output?.data) {
-      logits = await output.data();
-    } else if (ArrayBuffer.isView(output)) {
-      logits = output;
-    } else if (Array.isArray(output)) {
-      logits = output;
-    } else if (output == null) {
-      console.warn("Video inference returned no output tensor");
-      return [];
-    } else {
-      console.warn("Video inference returned unexpected output", output);
-      return [];
-    }
-    if (output?.dispose) {
-      output.dispose();
-    }
-    if (!logits || logits.length === 0) {
-      console.warn("Video inference produced empty logits");
-      return [];
-    }
-
-    const { maxIdx, maxProb } = softmaxTop1(Array.from(logits));
-    const label =
-      inferenceState.videoClassMap[maxIdx] ||
-      `video_class_${maxIdx}`;
-
-    const latencyMs = Math.max(Math.round(performance.now() - start), 1);
-    const confidence = Math.max(Math.min(maxProb, 1), 0);
-
-    return [
-      {
-        class: label,
-        confidence,
-        timestamp: endTs.toISOString(),
-        model_id: inferenceState.videoModelId,
-        inference_latency_ms: latencyMs,
-        origin: "client",
-      },
-    ];
-  } catch (error) {
-    console.error("Video inference failed", error);
-    return [];
-  }
-}
-
-async function sampleVideoFrames(blob, frameCount, targetSize, fallbackDurationSec = 0) {
-  if (typeof document === "undefined") {
-    return null;
-  }
-  const url = URL.createObjectURL(blob);
-  const video = document.createElement("video");
-  video.muted = true;
-  video.preload = "auto";
-  video.playsInline = true;
-  video.crossOrigin = "anonymous";
-  video.src = url;
-  if (video.load) {
-    video.load();
-  }
-
-  try {
-    await new Promise((resolve, reject) => {
-      const onMetadata = () => resolve();
-      const onError = (event) =>
-        reject(
-          new Error(event?.message || "Unable to decode video for inference"),
-        );
-      video.addEventListener("loadedmetadata", onMetadata, { once: true });
-      video.addEventListener("error", onError, { once: true });
-    });
-
-    if (
-      !video.videoWidth ||
-      !video.videoHeight ||
-      video.videoWidth <= 0 ||
-      video.videoHeight <= 0
-    ) {
-      console.warn("Video metadata missing width/height/duration; skipping video inference", {
-        width: video.videoWidth,
-        height: video.videoHeight,
-        duration: video.duration,
-      });
-      return null;
-    }
-
-    const rawDuration = Number.isFinite(video.duration) ? video.duration : fallbackDurationSec;
-    const safeDuration = Math.max(rawDuration, fallbackDurationSec, 0.001);
-    const canvas =
-      typeof OffscreenCanvas !== "undefined"
-        ? new OffscreenCanvas(targetSize, targetSize)
-        : (() => {
-            const element = document.createElement("canvas");
-            element.width = targetSize;
-            element.height = targetSize;
-            return element;
-          })();
-    const ctx = canvas.getContext("2d", { willReadFrequently: true });
-    if (!ctx) {
-      return null;
-    }
-    if (ctx.canvas) {
-      ctx.canvas.width = targetSize;
-      ctx.canvas.height = targetSize;
-    }
-
-    const frames = new Float32Array(frameCount * targetSize * targetSize * 3);
-    const step = safeDuration / frameCount;
-    const sampleTimes = [];
-    for (let i = 0; i < frameCount; i++) {
-      const midpoint = step * (i + 0.5);
-      const clamped = Math.min(
-        Math.max(midpoint, 0),
-        Math.max(safeDuration - 0.001, 0),
-      );
-      sampleTimes.push(clamped);
-    }
-
-    for (let i = 0; i < sampleTimes.length; i++) {
-      try {
-        await seekVideo(video, sampleTimes[i]);
-      } catch (error) {
-        console.warn("Video seek failed; continuing with previous frame", error);
-      }
-      drawVideoFrame(ctx, video, targetSize);
-      const pixels = ctx.getImageData(0, 0, targetSize, targetSize).data;
-      const offset = i * targetSize * targetSize * 3;
-      normalizeFrame(pixels, frames, offset);
-    }
-
-    return { data: frames, frameCount };
-  } finally {
-    URL.revokeObjectURL(url);
-    video.src = "";
-  }
-}
-
-function seekVideo(video, timeSec) {
-  return new Promise((resolve, reject) => {
-    const clamped = Math.min(
-      Math.max(timeSec, 0),
-      Math.max((video.duration || 0) - 0.001, 0),
-    );
-    const cleanup = () => {
-      video.removeEventListener("seeked", onSeeked);
-      video.removeEventListener("error", onError);
-    };
-    const onSeeked = () => {
-      cleanup();
-      resolve();
-    };
-    const onError = (event) => {
-      cleanup();
-      reject(
-        event?.error || new Error("Video seek failed during preprocessing"),
-      );
-    };
-
-    if (
-      video.readyState >= (window.HTMLMediaElement?.HAVE_CURRENT_DATA || 2) &&
-      Math.abs(video.currentTime - clamped) < 0.01
-    ) {
-      cleanup();
-      resolve();
-      return;
-    }
-
-    video.addEventListener("seeked", onSeeked, { once: true });
-    video.addEventListener("error", onError, { once: true });
-    try {
-      video.currentTime = clamped;
-    } catch (error) {
-      cleanup();
-      reject(error);
-    }
-  });
-}
-
-function drawVideoFrame(ctx, video, targetSize) {
-  drawFrameToCanvas(ctx, video, targetSize);
-}
 
 function drawFrameToCanvas(ctx, source, targetSize) {
   const videoWidth =
@@ -2177,6 +1903,10 @@ function cleanupLiveUpdates() {
     socket.onclose = null;
     socket.close();
   }
+  if (inferenceWorkerBridge) {
+    inferenceWorkerBridge.terminate();
+    inferenceWorkerBridge = null;
+  }
 }
 
 startButton.addEventListener("click", startSession);
@@ -2184,6 +1914,7 @@ stopButton.addEventListener("click", stopSession);
 refreshButton.addEventListener("click", loadSessions);
 
 document.addEventListener("DOMContentLoaded", async () => {
+  preloadInferenceResources();
   applyConfigToInputs();
   renderDetectionLog();
   setStatus("Loading sessions…");

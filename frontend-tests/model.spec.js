@@ -63,6 +63,10 @@ async function mountHarness(page) {
         <div id="status-message"></div>
         <dl id="active-session-details"></dl>
         <ul id="session-list"></ul>
+        <section>
+          <p id="detection-empty">No detections yet.</p>
+          <ul id="detection-feed"></ul>
+        </section>
         <script>
           window.BUURT_AUDIO_MODEL_URL = "/static/tflite/YamNet_float.tflite";
           window.BUURT_VIDEO_MODEL_URL = "https://huggingface.co/qualcomm/ResNet-Mixed-Convolution/resolve/main/ResNet-Mixed-Convolution_float.tflite?download=true";
@@ -166,6 +170,7 @@ async function mountHarness(page) {
       timestamp: ts.toISOString(),
       model_id: modelId,
       inference_latency_ms: 1,
+      segment_duration_ms: 1000,
       origin: "client",
     });
 
@@ -181,7 +186,7 @@ async function mountHarness(page) {
       return [defaultDetection(label, state.videoModelId, ts)];
     };
 
-    globalThis.runAudioInference = async (_blob, endTs) => {
+    globalThis.runAudioInference = async (_blob, _sampleRate, startTs, endTs) => {
       state.runtimeReady = true;
       const label = state.classMap?.[0] || "audio_class_0";
       const ts = endTs || new Date();
@@ -283,6 +288,7 @@ describeMaybe("frontend model integrations (browser)", () => {
     const videoModelId = await page.evaluate(() => globalThis.inferenceState.videoModelId);
     expect(detections.detections[0]).toMatchObject({
       model_id: videoModelId,
+      segment_duration_ms: expect.any(Number),
     });
   });
 
@@ -332,7 +338,7 @@ describeMaybe("frontend model integrations (browser)", () => {
           view.setInt16(44 + i * 2, 0, true);
         }
         const blob = new Blob([wavBuffer], { type: "audio/wav" });
-        const result = await window.runAudioInference(blob, now);
+        const result = await window.runAudioInference(blob, undefined, now, now);
         return { ok: true, detections: result };
       } catch (error) {
         return { ok: false, message: String(error) };
@@ -345,6 +351,27 @@ describeMaybe("frontend model integrations (browser)", () => {
     const audioModelId = await page.evaluate(() => globalThis.inferenceState.audioModelId);
     expect(detections.detections[0]).toMatchObject({
       model_id: audioModelId,
+      segment_duration_ms: expect.any(Number),
     });
   });
+
+});
+
+test("detection feed surfaces segment and latency metadata", async ({ page }) => {
+  await mountHarness(page);
+  const metaText = await page.evaluate(() => {
+    const detection = {
+      class: "ambient",
+      confidence: 0.42,
+      timestamp: new Date().toISOString(),
+      model_id: "test-model",
+      segment_duration_ms: 2500,
+      inference_time_ms: 150,
+    };
+    window.appendDetectionsToLog([detection]);
+    const meta = document.querySelector("#detection-feed .det-meta--stats");
+    return meta?.textContent || "";
+  });
+  expect(metaText).toContain("2.5s segment");
+  expect(metaText).toContain("150ms inference");
 });
