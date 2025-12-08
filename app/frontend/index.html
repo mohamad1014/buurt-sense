@@ -4,7 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Buurt Sense MVP</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="icon" href="/static/favicon.ico" />
+    <link rel="stylesheet" href="/static/styles.css?v=20241205" />
   </head>
   <body>
     <header class="page-header">
@@ -140,6 +141,32 @@
                 <span class="field-hint">Enable on-device video detections.</span>
               </label>
             </div>
+            <div class="form-grid">
+              <label class="form-field" for="config-inference-method">
+                <div class="field-header">
+                  <span>Inference method</span>
+                </div>
+                <select id="config-inference-method">
+                  <option value="smolvlm">SmolVLM2 (WebGPU/WASM)</option>
+                  <option value="worker">Legacy on-device classifiers</option>
+                </select>
+                <span class="field-hint">
+                  SmolVLM2 runs in-browser by default and can fall back to the legacy worker if needed.
+                </span>
+              </label>
+              <label class="form-field" for="config-smolvlm-model">
+                <div class="field-header">
+                  <span>SmolVLM2 variant</span>
+                </div>
+                <select id="config-smolvlm-model">
+                  <option value="HuggingFaceTB/SmolVLM2-256M-Instruct">256M · fastest &amp; mobile-friendly</option>
+                  <option value="HuggingFaceTB/SmolVLM2-500M-Video-Instruct">500M · higher quality</option>
+                </select>
+                <span class="field-hint">
+                  Larger checkpoints need more GPU/CPU memory; 256M is recommended for most phones.
+                </span>
+              </label>
+            </div>
             <button id="reset-config" type="button" class="ghost small">
               Reset defaults
             </button>
@@ -180,6 +207,6 @@
       <p class="noscript">JavaScript is required to control recording sessions.</p>
     </noscript>
 
-    <script src="/static/app.js" defer></script>
+    <script src="/static/app.js?v=20241205" defer></script>
   </body>
 </html>

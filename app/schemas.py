@@ -27,8 +27,8 @@ class ConfigSnapshot(BaseModel):
 
     @validator("segment_length_sec")
     def validate_segment_length(cls, value: int) -> int:
-        if value < 10 or value > 60:
-            raise ValueError("segment_length_sec must be between 10 and 60 seconds")
+        if value < 2 or value > 60:
+            raise ValueError("segment_length_sec must be between 2 and 60 seconds")
         return value
 
     @root_validator

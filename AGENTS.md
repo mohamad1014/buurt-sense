@@ -15,3 +15,8 @@
 - Avoid adding unnecessary complexity or bloat.
 - Focus on maintainability and readability.
 - Review code for potential performance improvements.
+
+- Use available mcp servers to test functionalities
+- Add tests to the test suite when needed
+- Apply the user instructions.
+- Keep in mind that you are running on Ubuntu within WSL.

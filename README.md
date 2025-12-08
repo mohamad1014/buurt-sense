@@ -9,6 +9,7 @@ AI-powered neighbourhood awareness platform. Empowers communities to record and 
 - ✅ **Local persistence** of recorded artifacts and metadata (SQLite at `buurtsense.db` + media under `recordings/<session-id>/`).
 - ✅ **Pydantic session model** that enforces timezone-aware timestamps (`app/models.py`).
 - ✅ **Comprehensive pytest suite** covering the session lifecycle and error handling (`tests/test_sessions.py`).
+- ✅ **Client-side video summaries** via SmolVLM2 (WebGPU/WASM) with a UI toggle to fall back to the legacy TF.js/TFLite worker classifiers.
 - ⚠️ **Not production-ready**—no auth/multi-user flows, inference is stubbed, and data lives only on the local machine; roadmap items below remain planned work.
 
 ## Running the Local API

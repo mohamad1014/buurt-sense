@@ -7,6 +7,8 @@ const sessionList = document.getElementById("session-list");
 const captureSettingsForm = document.getElementById("capture-settings-form");
 const audioInferenceToggle = document.getElementById("config-audio-inference");
 const videoInferenceToggle = document.getElementById("config-video-inference");
+const inferenceMethodSelect = document.getElementById("config-inference-method");
+const smolVlmModelSelect = document.getElementById("config-smolvlm-model");
 const segmentLengthInput = document.getElementById("config-segment-length");
 const overlapInput = document.getElementById("config-overlap");
 const confidenceInput = document.getElementById("config-confidence");
@@ -64,6 +66,28 @@ const inferenceState = {
   videoFrameCount: 16,
   videoInputSize: 112,
 };
+
+const INFERENCE_METHODS = {
+  SMOLVLM: "smolvlm",
+  WORKER: "worker",
+};
+
+const SMOLVLM_DEFAULT_MODEL = "HuggingFaceTB/SmolVLM2-256M-Instruct";
+const SMOLVLM_VIDEO_MODEL = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct";
+const TRANSFORMERS_WASM_BASE =
+  "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/dist/";
+const smolVlmOptions = {
+  frameCount: 4,
+  maxNewTokens: 192,
+};
+const SMOLVLM_DEBUG_ENABLED =
+  (typeof window !== "undefined" &&
+    window.localStorage?.getItem("BUURT_DEBUG_SMOLVLM") === "1") ||
+  false;
+
+let smolVlmClient = null;
+let smolVlmUnavailable = false;
+let smolVlmForcedFallback = false;
 
 class InferenceWorkerBridge {
   constructor(config) {
@@ -258,6 +282,442 @@ async function runVideoInference(videoSource, startTs, endTs) {
   return Array.isArray(detections) ? detections : [];
 }
 
+class SmolVlmClient {
+  constructor() {
+    this.modelId = null;
+    this.model = null;
+    this.processor = null;
+    this.rawImageCtor = null;
+    this.modelPromise = null;
+    this.runtimePromise = null;
+    this.device = null;
+  }
+
+  preferredDevice() {
+    return "wasm";
+  }
+
+  async loadRuntime() {
+    if (this.runtimePromise) {
+      return this.runtimePromise;
+    }
+    const load = async () => {
+      if (globalThis.transformers) {
+        return globalThis.transformers;
+      }
+      const module = await import("https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1");
+      const runtime = module?.default ?? module;
+      if (runtime?.env) {
+        runtime.env.allowLocalModels = false;
+        runtime.env.allowRemoteModels = true;
+        // Disable Cache API usage to avoid quota/driver errors seen on some browsers.
+        runtime.env.useCache = false;
+        runtime.env.useBrowserCache = false;
+        runtime.env.useFSCache = false;
+        if (runtime.env.backends?.onnx?.wasm) {
+          const wasm = runtime.env.backends.onnx.wasm;
+          // Use the WASM assets bundled with the same transformers.js version to avoid ABI mismatches.
+          wasm.wasmPaths = TRANSFORMERS_WASM_BASE;
+          // Force single-threaded execution so SharedArrayBuffer is not required on non-isolated pages.
+          wasm.proxy = false;
+          wasm.numThreads = 1;
+        }
+      }
+      return runtime;
+    };
+    this.runtimePromise = load().catch((error) => {
+      this.runtimePromise = null;
+      throw error;
+    });
+    return this.runtimePromise;
+  }
+
+  async ensureModel(modelId = SMOLVLM_DEFAULT_MODEL) {
+    const targetModelId = modelId || SMOLVLM_DEFAULT_MODEL;
+    if (this.model && this.processor && this.modelId === targetModelId) {
+      return {
+        model: this.model,
+        processor: this.processor,
+        rawImageCtor: this.rawImageCtor,
+        device: this.device,
+      };
+    }
+    if (this.modelPromise && this.modelId === targetModelId) {
+      return this.modelPromise;
+    }
+    const runtime = await this.loadRuntime();
+    const { AutoProcessor, AutoModelForVision2Seq, RawImage } = runtime;
+    const targetDevice = this.preferredDevice();
+    const loadForDevice = async (device) => {
+      const processor = await AutoProcessor.from_pretrained(targetModelId);
+      const model = await AutoModelForVision2Seq.from_pretrained(targetModelId, {
+        device,
+        dtype: "fp32",
+      });
+      // SmolVLM image processor can split images into many tiles, producing huge attention masks.
+      // Disable splitting and constrain image size to keep memory bounded in browsers.
+      if (processor?.image_processor) {
+        const img = processor.image_processor;
+        img.do_image_splitting = false;
+        if (img.config) {
+          img.config.do_image_splitting = false;
+          img.config.do_image_splitting_layers = [];
+          img.config.image_size = { height: 224, width: 224 };
+          img.config.size = { height: 224, width: 224 };
+        }
+      }
+      return { processor, model, rawImageCtor: RawImage, device };
+    };
+    const promise = (async () => {
+      try {
+        return await loadForDevice(targetDevice);
+      } catch (primaryError) {
+        if (targetDevice !== "wasm") {
+          console.warn("WebGPU failed for SmolVLM2; retrying with WASM", primaryError);
+          return loadForDevice("wasm");
+        }
+        throw primaryError;
+      }
+    })();
+
+    this.modelId = targetModelId;
+    this.modelPromise = promise
+      .then((result) => {
+        this.model = result.model;
+        this.processor = result.processor;
+        this.rawImageCtor = result.rawImageCtor;
+        this.device = result.device;
+        this.modelPromise = null;
+        markSmolVlmReady();
+        return result;
+      })
+      .catch((error) => {
+        this.modelPromise = null;
+        this.modelId = null;
+        disableSmolVlm("SmolVLM2 permanently disabled due to load failure", error);
+        throw error;
+      });
+    return this.modelPromise;
+  }
+
+  async seekVideo(video, timestamp) {
+    if (!Number.isFinite(timestamp)) {
+      return;
+    }
+    if (Math.abs(video.currentTime - timestamp) < 0.01) {
+      return;
+    }
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        video.removeEventListener("seeked", onSeeked);
+        video.removeEventListener("error", onError);
+      };
+      const onSeeked = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve();
+      };
+      const onError = (event) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(event?.error || new Error("Video seek failed"));
+      };
+      video.addEventListener("seeked", onSeeked, { once: true });
+      video.addEventListener("error", onError, { once: true });
+      try {
+        video.currentTime = Math.max(timestamp, 0);
+      } catch (error) {
+        cleanup();
+        reject(error);
+      }
+    });
+  }
+
+  async extractFramesFromBlob(blob, frameCount = smolVlmOptions.frameCount) {
+    if (!blob) {
+      return [];
+    }
+    const runtime = await this.loadRuntime();
+    const RawImage = runtime?.RawImage;
+    if (!RawImage) {
+      console.warn("SmolVLM runtime missing RawImage helper");
+      return [];
+    }
+    const url = URL.createObjectURL(blob);
+    const video = document.createElement("video");
+    video.src = url;
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = "auto";
+    video.crossOrigin = "anonymous";
+
+    try {
+      await new Promise((resolve, reject) => {
+        video.onloadedmetadata = () => resolve(true);
+        video.onerror = () => reject(new Error("Failed to load video for SmolVLM2"));
+      });
+    } catch (error) {
+      URL.revokeObjectURL(url);
+      return [];
+    }
+
+    const duration = Number.isFinite(video.duration) && video.duration > 0
+      ? video.duration
+      : 1;
+    const sourceWidth = video.videoWidth || 320;
+    const sourceHeight = video.videoHeight || 320;
+    const maxDim = 384;
+    const scale = Math.min(maxDim / Math.max(sourceWidth, sourceHeight), 1);
+    const targetWidth = Math.max(Math.round(sourceWidth * scale), 1);
+    const targetHeight = Math.max(Math.round(sourceHeight * scale), 1);
+    const canvas = document.createElement("canvas");
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) {
+      URL.revokeObjectURL(url);
+      return [];
+    }
+
+    const frames = [];
+    const safeFrameCount = Math.max(Math.min(frameCount, 32), 1);
+    for (let i = 0; i < safeFrameCount; i++) {
+      const t = safeFrameCount === 1 ? duration / 2 : (duration * i) / (safeFrameCount - 1);
+      try {
+        await this.seekVideo(video, Math.min(t, duration));
+        ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
+        // eslint-disable-next-line no-await-in-loop
+        const raw = await this.rawImageFromCanvas(RawImage, ctx, targetWidth, targetHeight);
+        if (raw) {
+          frames.push(raw);
+        }
+      } catch (error) {
+        console.warn("Failed to sample frame for SmolVLM2", error);
+      }
+    }
+
+    URL.revokeObjectURL(url);
+    return frames;
+  }
+
+  async rawImageFromCanvas(RawImage, ctx, width, height) {
+    if (!RawImage || !ctx) {
+      return null;
+    }
+    if (typeof RawImage.fromHTMLCanvasElement === "function") {
+      return RawImage.fromHTMLCanvasElement(ctx.canvas);
+    }
+    if (typeof RawImage.fromCanvas === "function") {
+      return RawImage.fromCanvas(ctx.canvas);
+    }
+    if (typeof RawImage.fromImageData === "function") {
+      const imageData = ctx.getImageData(0, 0, width, height);
+      return RawImage.fromImageData(imageData);
+    }
+    if (typeof ctx.canvas.convertToBlob === "function") {
+      const blob = await ctx.canvas.convertToBlob({ type: "image/png" });
+      if (typeof RawImage.fromBlob === "function") {
+        return RawImage.fromBlob(blob);
+      }
+      return null;
+    }
+    const blob = await new Promise((resolve) => {
+      ctx.canvas.toBlob((b) => resolve(b), "image/png");
+    });
+    if (blob && typeof RawImage.fromBlob === "function") {
+      return RawImage.fromBlob(blob);
+    }
+    return null;
+  }
+
+  async describeVideoBlob(blob, options = {}) {
+    const modelId = options.modelId || SMOLVLM_DEFAULT_MODEL;
+    const frameCount = options.frameCount ?? smolVlmOptions.frameCount;
+    const prompt = options.prompt || "These images are frames from a video in chronological order. Describe what happens in the video in detail.";
+    let frames = [];
+    let modelArtifacts;
+    let capturedFrames = [];
+    try {
+      [frames, modelArtifacts] = await Promise.all([
+        this.extractFramesFromBlob(blob, frameCount),
+        this.ensureModel(modelId),
+      ]);
+      const usableFrames = frames.filter((frame) => {
+        if (!frame) return false;
+        const height = frame.height ?? frame.rows;
+        const width = frame.width ?? frame.cols;
+        return Number.isFinite(height) && Number.isFinite(width) && height > 0 && width > 0;
+      });
+      frames = usableFrames;
+      capturedFrames = usableFrames;
+
+      if (!frames.length || !modelArtifacts?.processor || !modelArtifacts?.model) {
+        return { text: null, latencyMs: null, device: modelArtifacts?.device ?? null };
+      }
+
+      const stitchFramesIfNeeded = async (frameList) => {
+        if (!frameList || frameList.length <= 1) {
+          return frameList;
+        }
+        const first = frameList[0];
+        const width = first.width ?? first.cols ?? 224;
+        const height = first.height ?? first.rows ?? 224;
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height * frameList.length;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          return [first];
+        }
+        frameList.forEach((frame, index) => {
+          const data = frame.data instanceof Uint8ClampedArray
+            ? frame.data
+            : new Uint8ClampedArray(frame.data);
+          const imageData = new ImageData(data, width, height);
+          ctx.putImageData(imageData, 0, index * height);
+        });
+        const stitched = await modelArtifacts.rawImageCtor.fromCanvas(canvas);
+        return [stitched];
+      };
+
+      frames = await stitchFramesIfNeeded(frames);
+      exportFramesForDebug(frames, "smolvlm-stitched");
+
+      const buildMessages = (frameList) => ([
+        {
+          role: "user",
+          content: [
+            ...frameList.map(() => ({ type: "image" })),
+            { type: "text", text: prompt },
+          ],
+        },
+      ]);
+
+      const decodeTokens = (tokenIds, tokenizer) => {
+        if (!tokenIds || !tokenizer) {
+          return null;
+        }
+        const sequences = Array.isArray(tokenIds) ? tokenIds : [tokenIds];
+        if (typeof tokenizer.batch_decode === "function") {
+          const decoded = tokenizer.batch_decode(sequences, { skip_special_tokens: true });
+          return Array.isArray(decoded) ? decoded[0] : decoded;
+        }
+        if (typeof tokenizer.decode === "function") {
+          return tokenizer.decode(sequences[0] ?? sequences, { skip_special_tokens: true });
+        }
+        return null;
+      };
+
+      const buildInputs = async (frameList) => {
+        const templated = modelArtifacts.processor.apply_chat_template(
+          buildMessages(frameList),
+          { add_generation_prompt: true, tokenize: false },
+        );
+        return modelArtifacts.processor(
+          templated,
+          frameList,
+          {
+            return_tensors: "np",
+            return_row_col_info: false,
+            do_image_splitting: false,
+            image_size: { height: 224, width: 224 },
+          },
+        );
+      };
+
+      let inputs;
+      try {
+        inputs = await buildInputs(frames);
+      } catch (error) {
+        console.warn("SmolVLM2 processor failed; retrying with a single frame", error);
+        const fallbackFrame = frames[Math.floor(frames.length / 2)] ?? frames[0];
+        frames = [fallbackFrame];
+        inputs = await buildInputs(frames);
+      }
+      const runGeneration = async (inputTensors) => {
+        const start = performance.now();
+        const generation = await modelArtifacts.model.generate({
+          ...inputTensors,
+          max_new_tokens: smolVlmOptions.maxNewTokens,
+        });
+        const latencyMs = Math.max(Math.round(performance.now() - start), 1);
+        const sequences = generation?.sequences ?? generation;
+        const summary = decodeTokens(sequences, modelArtifacts.processor.tokenizer);
+        return { text: summary, latencyMs };
+      };
+
+      try {
+        const { text, latencyMs } = await runGeneration(inputs);
+        return {
+          text,
+          latencyMs,
+          device: modelArtifacts.device,
+        };
+      } catch (generationError) {
+        const message = generationError?.message || String(generationError);
+        const tokenFeatureMismatch = message.includes("Number of tokens and features do not match");
+        if (tokenFeatureMismatch && frames.length > 1) {
+          console.warn("SmolVLM2 token/feature mismatch; retrying with a single frame", generationError);
+          const fallbackFrame = frames[Math.floor(frames.length / 2)] ?? frames[0];
+          try {
+            const singleInputs = await buildInputs([fallbackFrame]);
+            frames = [fallbackFrame];
+            const { text, latencyMs } = await runGeneration(singleInputs);
+            return {
+              text,
+              latencyMs,
+              device: modelArtifacts.device,
+            };
+          } catch (retryError) {
+            console.warn("SmolVLM2 retry after mismatch failed", retryError);
+          }
+        }
+        console.warn("SmolVLM2 generation failed", generationError);
+        return {
+          text: null,
+          latencyMs: null,
+          device: modelArtifacts.device,
+          error: message,
+        };
+      }
+    } catch (fatalError) {
+      console.warn("SmolVLM2 describeVideoBlob failed", fatalError);
+      return {
+        text: null,
+        latencyMs: null,
+        device: modelArtifacts?.device ?? null,
+        error: fatalError?.message || String(fatalError),
+      };
+    } finally {
+      capturedFrames.forEach((frame) => {
+        if (frame?.dispose) {
+          try {
+            frame.dispose();
+          } catch {
+            // ignore disposal errors
+          }
+        }
+      });
+    }
+  }
+
+  preload() {
+    return this.loadRuntime().catch((error) => {
+      console.warn("SmolVLM preload failed", error);
+    });
+  }
+}
+
+function getSmolVlmClient() {
+  if (!smolVlmClient) {
+    smolVlmClient = new SmolVlmClient();
+  }
+  return smolVlmClient;
+}
+
 const DEFAULT_CONFIG = {
   segment_length_sec: 10,
   overlap_sec: 5,
@@ -265,6 +725,9 @@ const DEFAULT_CONFIG = {
   preview_enabled: false,
   audio_inference_enabled: true,
   video_inference_enabled: true,
+  inference_method: INFERENCE_METHODS.SMOLVLM,
+  smolvlm_model_id: SMOLVLM_DEFAULT_MODEL,
+  smolvlm_forced_fallback: false,
 };
 
 function loadStoredConfig() {
@@ -289,6 +752,41 @@ function persistConfig() {
   } catch (error) {
     console.warn("Failed to persist capture config", error);
   }
+}
+
+function waitForMs(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, Math.max(ms || 0, 0));
+  });
+}
+
+function markSmolVlmReady() {
+  smolVlmUnavailable = false;
+  const forcedFallback = smolVlmForcedFallback || userConfig.smolvlm_forced_fallback;
+  const switchedFromWorker = userConfig.inference_method !== INFERENCE_METHODS.SMOLVLM;
+  if (forcedFallback || switchedFromWorker) {
+    smolVlmForcedFallback = false;
+    userConfig.smolvlm_forced_fallback = false;
+    userConfig.inference_method = INFERENCE_METHODS.SMOLVLM;
+    persistConfig();
+    applyConfigToInputs();
+    setStatus("SmolVLM2 ready. Switched back to default inference.", "info");
+  }
+}
+
+function disableSmolVlm(reason, error) {
+  const message = reason || "SmolVLM2 unavailable; using legacy inference.";
+  console.warn(message, error || "");
+  if (smolVlmUnavailable) {
+    return;
+  }
+  smolVlmUnavailable = true;
+  smolVlmForcedFallback = true;
+  userConfig.smolvlm_forced_fallback = true;
+  userConfig.inference_method = INFERENCE_METHODS.WORKER;
+  persistConfig();
+  applyConfigToInputs();
+  setStatus("SmolVLM2 unavailable; using legacy inference.", "warning");
 }
 
 function clamp(value, min, max) {
@@ -355,6 +853,14 @@ function getEffectiveConfig() {
   const preview = Boolean(userConfig.preview_enabled);
   const audioInference = userConfig.audio_inference_enabled ?? DEFAULT_CONFIG.audio_inference_enabled;
   const videoInference = userConfig.video_inference_enabled ?? DEFAULT_CONFIG.video_inference_enabled;
+  const inferenceMethod = smolVlmUnavailable
+    ? INFERENCE_METHODS.WORKER
+    : userConfig.inference_method === INFERENCE_METHODS.WORKER
+      ? INFERENCE_METHODS.WORKER
+      : INFERENCE_METHODS.SMOLVLM;
+  const smolvlmModelId = typeof userConfig.smolvlm_model_id === "string" && userConfig.smolvlm_model_id
+    ? userConfig.smolvlm_model_id
+    : SMOLVLM_DEFAULT_MODEL;
   return {
     segment_length_sec: segment,
     overlap_sec: overlap,
@@ -362,6 +868,8 @@ function getEffectiveConfig() {
     preview_enabled: preview,
     audio_inference_enabled: Boolean(audioInference),
     video_inference_enabled: Boolean(videoInference),
+    inference_method: inferenceMethod,
+    smolvlm_model_id: smolvlmModelId,
   };
 }
 
@@ -399,6 +907,15 @@ function updateConfigFromInputs() {
   if (videoInferenceToggle) {
     userConfig.video_inference_enabled = Boolean(videoInferenceToggle.checked);
   }
+  if (inferenceMethodSelect) {
+    userConfig.inference_method =
+      inferenceMethodSelect.value === INFERENCE_METHODS.WORKER
+        ? INFERENCE_METHODS.WORKER
+        : INFERENCE_METHODS.SMOLVLM;
+  }
+  if (smolVlmModelSelect) {
+    userConfig.smolvlm_model_id = smolVlmModelSelect.value || SMOLVLM_DEFAULT_MODEL;
+  }
   persistConfig();
   return getEffectiveConfig();
 }
@@ -423,6 +940,12 @@ function applyConfigToInputs() {
   }
   if (videoInferenceToggle) {
     videoInferenceToggle.checked = Boolean(config.video_inference_enabled);
+  }
+  if (inferenceMethodSelect) {
+    inferenceMethodSelect.value = config.inference_method || INFERENCE_METHODS.SMOLVLM;
+  }
+  if (smolVlmModelSelect) {
+    smolVlmModelSelect.value = config.smolvlm_model_id || SMOLVLM_DEFAULT_MODEL;
   }
   updateSliderDisplays(config);
   updatePreviewToggleButton();
@@ -756,14 +1279,71 @@ async function fetchJson(url, options) {
   return response.json();
 }
 
-async function getMobileDetections(blob, startTs, endTs, index) {
+async function runSmolVlmDetections(blob, startTs, endTs, index, config) {
+  if (!config.video_inference_enabled || smolVlmUnavailable) {
+    return [];
+  }
+  const durationMs = computeSegmentDurationMs(startTs, endTs);
+  try {
+    const client = getSmolVlmClient();
+    const result = await client.describeVideoBlob(blob, {
+      modelId: config.smolvlm_model_id || SMOLVLM_DEFAULT_MODEL,
+      frameCount: smolVlmOptions.frameCount,
+    });
+    if (!result?.text) {
+      console.warn("SmolVLM2 returned no summary");
+      return [];
+    }
+    const detection = {
+      class: result.text,
+      confidence: 1,
+      timestamp: endTs.toISOString(),
+      model_id: `${config.smolvlm_model_id}${result.device ? `@${result.device}` : ""}`,
+      inference_time_ms: result.latencyMs ?? null,
+      segment_duration_ms: durationMs,
+      index,
+    };
+    appendDetectionsToLog([detection]);
+    return [detection];
+  } catch (error) {
+    const message = error?.message || String(error || "");
+    const isOrtRuntimeError = message.includes("107891176") || /^\d+$/.test(message.trim());
+    if (isOrtRuntimeError) {
+      console.warn("SmolVLM2 runtime error; keeping SmolVLM enabled but skipping segment", error);
+      return [];
+    }
+    disableSmolVlm("SmolVLM2 inference failed; switching to legacy worker", error);
+    const context = captureState.context;
+    if (!captureState.inference && context?.stream && context.segmentLengthMs) {
+      startLiveInference(context.stream, context.segmentLengthMs)
+        .then((inference) => {
+          captureState.inference = inference;
+        })
+        .catch((err) => {
+          console.warn("Failed to spin up legacy inference after SmolVLM failure", err);
+        });
+    }
+    return runLegacyWorkerDetections(blob, startTs, endTs, index, config);
+  }
+}
+
+async function runLegacyWorkerDetections(blob, startTs, endTs, index, config) {
+  if (!captureState.inference && captureState.context?.stream && captureState.context.segmentLengthMs) {
+    try {
+      captureState.inference = await startLiveInference(
+        captureState.context.stream,
+        captureState.context.segmentLengthMs,
+      );
+    } catch (error) {
+      console.warn("Legacy inference pipeline failed to start", error);
+    }
+  }
   try {
     const inference = captureState.inference;
     if (!inference) {
       console.warn("Inference pipeline missing; skipping detections");
       return [];
     }
-    const config = getEffectiveConfig();
     const segmentAudio = config.audio_inference_enabled
       ? inference.consumeAudioSegment()
       : null;
@@ -812,6 +1392,37 @@ async function getMobileDetections(blob, startTs, endTs, index) {
     }
     return [];
   }
+}
+
+async function getMobileDetections(blob, startTs, endTs, index) {
+  const config = getEffectiveConfig();
+  if (smolVlmUnavailable && config.inference_method === INFERENCE_METHODS.SMOLVLM) {
+    config.inference_method = INFERENCE_METHODS.WORKER;
+  }
+  if (config.inference_method === INFERENCE_METHODS.SMOLVLM) {
+    return runSmolVlmDetections(blob, startTs, endTs, index, config);
+  }
+  return runLegacyWorkerDetections(blob, startTs, endTs, index, config);
+}
+
+async function preloadSmolVlmModel(modelId, attempts = 3) {
+  const smolClient = getSmolVlmClient();
+  smolClient.preload();
+  const targetModelId = modelId || SMOLVLM_DEFAULT_MODEL;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      await smolClient.ensureModel(targetModelId);
+      return true;
+    } catch (error) {
+      console.warn(`SmolVLM2 preload attempt ${attempt} failed`, error);
+      if (attempt === attempts) {
+        disableSmolVlm("SmolVLM2 preload failed; using legacy inference.", error);
+        return false;
+      }
+      await waitForMs(750 * attempt);
+    }
+  }
+  return false;
 }
 
 async function loadSessions(options = {}) {
@@ -1020,6 +1631,7 @@ async function startMediaCapture(session) {
   const segmentLengthSec =
     session?.config_snapshot?.segment_length_sec ?? 10;
   const segmentLengthMs = Math.max(segmentLengthSec * 1000, 1000);
+  const effectiveConfig = getEffectiveConfig();
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: true,
     video: {
@@ -1610,6 +2222,45 @@ function normalizeFrame(pixels, target, offset) {
   }
 }
 
+function exportFramesForDebug(frames, label = "smolvlm") {
+  if (!SMOLVLM_DEBUG_ENABLED || !Array.isArray(frames) || !frames.length) {
+    return;
+  }
+  const timestamp = Date.now();
+  frames.forEach((frame, index) => {
+    try {
+      const width = frame.width ?? frame.cols;
+      const height = frame.height ?? frame.rows;
+      const data = frame.data instanceof Uint8ClampedArray
+        ? frame.data
+        : new Uint8ClampedArray(frame.data);
+      if (!Number.isFinite(width) || !Number.isFinite(height) || !data) {
+        return;
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        return;
+      }
+      const imageData = new ImageData(data, width, height);
+      ctx.putImageData(imageData, 0, 0);
+      canvas.toBlob((blob) => {
+        if (!blob) return;
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = `${label}-${timestamp}-${index}.png`;
+        anchor.click();
+        URL.revokeObjectURL(url);
+      }, "image/png");
+    } catch (error) {
+      console.warn("Failed to export SmolVLM debug frame", error);
+    }
+  });
+}
+
 async function fetchModelFromCache(url) {
   if (window.caches) {
     const cache = await caches.open("buurt-models");
@@ -1857,7 +2508,15 @@ if (captureSettingsForm) {
     event.preventDefault();
   });
   captureSettingsForm.addEventListener("input", () => {
+    const previousMethod = getEffectiveConfig().inference_method;
     const config = updateConfigFromInputs();
+    if (config.inference_method !== previousMethod) {
+      if (config.inference_method === INFERENCE_METHODS.WORKER) {
+        preloadInferenceResources();
+      } else {
+        getSmolVlmClient().preload();
+      }
+    }
     updateSliderDisplays(config);
   });
 }
@@ -1914,9 +2573,11 @@ stopButton.addEventListener("click", stopSession);
 refreshButton.addEventListener("click", loadSessions);
 
 document.addEventListener("DOMContentLoaded", async () => {
-  preloadInferenceResources();
   applyConfigToInputs();
   renderDetectionLog();
+  const config = getEffectiveConfig();
+  preloadInferenceResources();
+  preloadSmolVlmModel(config.smolvlm_model_id);
   setStatus("Loading sessions…");
   await loadSessions();
   setupLiveUpdates();
