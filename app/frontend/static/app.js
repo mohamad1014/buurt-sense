@@ -38,6 +38,7 @@ const captureState = {
   uploads: [],
   orientationPermissionRequested: false,
   inference: null,
+  smolVlmFrameCapture: null,
 };
 
 const inferenceState = {
@@ -80,6 +81,7 @@ const smolVlmOptions = {
   frameCount: 8,
   maxNewTokens: 192,
 };
+const SMOLVLM_WORKER_TIMEOUT_MS = 180_000;
 const SMOLVLM_DEFAULT_PROMPT = "These images are frames from a video in chronological order from left to right. Describe what happens in the video in short.";
 const SMOLVLM_DEBUG_ENABLED =
   (typeof window !== "undefined" &&
@@ -91,6 +93,25 @@ let smolVlmWorkerClient = null;
 let smolVlmUnavailable = false;
 let smolVlmForcedFallback = false;
 let smolVlmQueue = Promise.resolve();
+
+function getSmolVlmWorkerTimeoutMs() {
+  const override = Number(globalThis.BUURT_SMOLVLM_WORKER_TIMEOUT_MS);
+  if (Number.isFinite(override) && override > 0) {
+    return Math.max(Math.floor(override), 1);
+  }
+  return SMOLVLM_WORKER_TIMEOUT_MS;
+}
+
+function shouldCaptureSmolVlmFrames(config, stream) {
+  if (!config?.video_inference_enabled || smolVlmUnavailable) {
+    return false;
+  }
+  if (config.inference_method !== INFERENCE_METHODS.SMOLVLM) {
+    return false;
+  }
+  const videoTracks = stream?.getVideoTracks?.() || [];
+  return videoTracks.length > 0;
+}
 
 class InferenceWorkerBridge {
   constructor(config) {
@@ -849,10 +870,144 @@ async function extractFramesForWorker(blob, frameCount = smolVlmOptions.frameCou
   return frames;
 }
 
+async function startSmolVlmLiveFrameCapture(context, stream, segmentLengthMs) {
+  const videoTrack = stream?.getVideoTracks?.()[0] || null;
+  if (!videoTrack) {
+    return null;
+  }
+
+  const maxDim = 384;
+  const frameTarget = Math.max(Math.min(smolVlmOptions.frameCount, 32), 1);
+  const frameIntervalMs = Math.max(
+    segmentLengthMs / (frameTarget + 1),
+    80,
+  );
+  let stopped = false;
+  let rafId = null;
+  let lastCapture = performance.now();
+
+  const video = document.createElement("video");
+  video.srcObject = new MediaStream([videoTrack]);
+  video.muted = true;
+  video.playsInline = true;
+  video.preload = "auto";
+
+  const ready = await new Promise((resolve) => {
+    let settled = false;
+    const cleanup = () => {
+      video.onloadedmetadata = null;
+      video.onerror = null;
+    };
+    video.onloadedmetadata = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(true);
+    };
+    video.onerror = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(false);
+    };
+  });
+
+  if (!ready) {
+    video.srcObject = null;
+    return null;
+  }
+
+  video.play().catch(() => {});
+
+  const sourceWidth = video.videoWidth || 320;
+  const sourceHeight = video.videoHeight || 320;
+  const scale = Math.min(maxDim / Math.max(sourceWidth, sourceHeight), 1);
+  const targetWidth = Math.max(Math.round(sourceWidth * scale), 1);
+  const targetHeight = Math.max(Math.round(sourceHeight * scale), 1);
+
+  const canvas =
+    typeof OffscreenCanvas !== "undefined"
+      ? new OffscreenCanvas(targetWidth, targetHeight)
+      : (() => {
+          const element = document.createElement("canvas");
+          element.width = targetWidth;
+          element.height = targetHeight;
+          return element;
+        })();
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) {
+    video.srcObject = null;
+    return null;
+  }
+
+  const capture = () => {
+    if (stopped) {
+      return;
+    }
+    const frames = context.smolVlmFrames;
+    const now = performance.now();
+    const shouldSample = Array.isArray(frames) && frames.length < frameTarget;
+    if (shouldSample && now - lastCapture >= frameIntervalMs) {
+      lastCapture = now;
+      try {
+        ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
+        const imageData = ctx.getImageData(0, 0, targetWidth, targetHeight);
+        frames.push({
+          width: targetWidth,
+          height: targetHeight,
+          data: new Uint8ClampedArray(imageData.data),
+        });
+      } catch (error) {
+        console.warn("Failed to sample live frame for SmolVLM2", error);
+      }
+    }
+    rafId = requestAnimationFrame(capture);
+  };
+
+  rafId = requestAnimationFrame(capture);
+
+  return {
+    stop() {
+      stopped = true;
+      if (rafId) {
+        cancelAnimationFrame(rafId);
+      }
+      try {
+        video.pause();
+      } catch {
+        // ignore
+      }
+      video.srcObject = null;
+    },
+  };
+}
+
 class SmolVlmWorkerClient {
   constructor() {
     this.worker = null;
     this.requests = new Map();
+    this.nextId = 1;
+    this.initPromise = null;
+  }
+
+  handleWorkerFailure(error) {
+    const failure = error instanceof Error ? error : new Error(String(error));
+    for (const pending of this.requests.values()) {
+      try {
+        pending.reject(failure);
+      } catch {
+        // ignore rejection errors
+      }
+    }
+    this.requests.clear();
+    if (this.worker) {
+      try {
+        this.worker.terminate();
+      } catch {
+        // ignore termination errors
+      }
+    }
+    this.worker = null;
     this.nextId = 1;
     this.initPromise = null;
   }
@@ -882,8 +1037,16 @@ class SmolVlmWorkerClient {
     };
     this.worker.onerror = (event) => {
       console.error("SmolVLM worker error", event);
+      this.handleWorkerFailure(event?.error || new Error("SmolVLM worker error"));
     };
-    this.initPromise = this.postMessage("INIT");
+    this.worker.onmessageerror = (event) => {
+      console.error("SmolVLM worker message error", event);
+      this.handleWorkerFailure(new Error("SmolVLM worker message error"));
+    };
+    this.initPromise = this.postMessage("INIT").catch((error) => {
+      this.handleWorkerFailure(error);
+      throw error;
+    });
     return this.initPromise;
   }
 
@@ -893,12 +1056,40 @@ class SmolVlmWorkerClient {
     }
     await this.initPromise;
     const id = this.nextId++;
+    const timeoutMs = getSmolVlmWorkerTimeoutMs();
+    let timeoutHandle = null;
     const promise = new Promise((resolve, reject) => {
-      this.requests.set(id, { resolve, reject });
+      timeoutHandle = window.setTimeout(() => {
+        const pending = this.requests.get(id);
+        if (!pending) {
+          return;
+        }
+        this.requests.delete(id);
+        const error = new Error(`SmolVLM worker request timed out (${type})`);
+        pending.reject(error);
+        this.handleWorkerFailure(error);
+      }, timeoutMs);
+      this.requests.set(id, {
+        resolve: (value) => {
+          if (timeoutHandle !== null) {
+            window.clearTimeout(timeoutHandle);
+          }
+          resolve(value);
+        },
+        reject: (error) => {
+          if (timeoutHandle !== null) {
+            window.clearTimeout(timeoutHandle);
+          }
+          reject(error);
+        },
+      });
     });
     try {
       this.worker.postMessage({ id, type, payload }, transfer);
     } catch (error) {
+      if (timeoutHandle !== null) {
+        window.clearTimeout(timeoutHandle);
+      }
       this.requests.delete(id);
       throw error;
     }
@@ -1519,7 +1710,7 @@ async function fetchJson(url, options) {
   return response.json();
 }
 
-async function runSmolVlmDetections(blob, startTs, endTs, index, config) {
+async function runSmolVlmDetections(blob, startTs, endTs, index, config, options = {}) {
   const emptyResult = { detections: [], frameImages: [] };
   if (!config.video_inference_enabled || smolVlmUnavailable) {
     return emptyResult;
@@ -1529,6 +1720,9 @@ async function runSmolVlmDetections(blob, startTs, endTs, index, config) {
   const prompt = SMOLVLM_DEFAULT_PROMPT;
   const frameCount = smolVlmOptions.frameCount;
   const frameLabel = `segment-${String(index).padStart(4, "0")}-smolvlm`;
+  const providedFrames = Array.isArray(options.smolVlmFrames)
+    ? options.smolVlmFrames
+    : [];
   let frameImages = [];
 
   // Ensure model is warmed up once; reuse across segments.
@@ -1547,7 +1741,15 @@ async function runSmolVlmDetections(blob, startTs, endTs, index, config) {
   try {
     const workerClient = getSmolVlmWorkerClient();
     workerClient.preload(modelId).catch(() => {});
-    const frames = await extractFramesForWorker(blob, frameCount);
+    const frames = providedFrames.length
+      ? providedFrames
+      : await extractFramesForWorker(blob, frameCount);
+    if (!frames.length) {
+      console.warn(
+        `SmolVLM2 frame extraction returned empty frames for segment ${index}`,
+        { type: blob?.type, size: blob?.size },
+      );
+    }
     frameImages = await encodeFramesToPngBlobs(frames, {
       label: frameLabel,
       stitch: true,
@@ -1562,7 +1764,7 @@ async function runSmolVlmDetections(blob, startTs, endTs, index, config) {
       appendDetectionsToLog([detection]);
       return { detections: [detection], frameImages };
     }
-    console.warn("SmolVLM2 worker returned no summary");
+    console.warn("SmolVLM2 worker returned no summary", workerResult?.error || "");
   } catch (error) {
     console.warn("SmolVLM2 worker inference failed; retrying on main thread", error);
   }
@@ -1584,7 +1786,7 @@ async function runSmolVlmDetections(blob, startTs, endTs, index, config) {
       appendDetectionsToLog([detection]);
       return { detections: [detection], frameImages };
     }
-    console.warn("SmolVLM2 returned no summary");
+    console.warn("SmolVLM2 returned no summary", result?.error || "");
   } catch (error) {
     console.warn("SmolVLM2 main-thread inference failed; using legacy worker for this segment", error);
   }
@@ -1660,14 +1862,14 @@ async function runLegacyWorkerDetections(blob, startTs, endTs, index, config) {
   }
 }
 
-async function getMobileDetections(blob, startTs, endTs, index) {
+async function getMobileDetections(blob, startTs, endTs, index, options = {}) {
   const config = getEffectiveConfig();
   if (smolVlmUnavailable && config.inference_method === INFERENCE_METHODS.SMOLVLM) {
     config.inference_method = INFERENCE_METHODS.WORKER;
   }
   if (config.inference_method === INFERENCE_METHODS.SMOLVLM) {
     const task = async () =>
-      runSmolVlmDetections(blob, startTs, endTs, index, config);
+      runSmolVlmDetections(blob, startTs, endTs, index, config, options);
     smolVlmQueue = smolVlmQueue
       .catch(() => {
         // Reset a broken queue before scheduling the next task.
@@ -1956,13 +2158,29 @@ async function startMediaCapture(session) {
     segmentIndex: 0,
     segmentLengthMs,
     segmentStart: null,
+    smolVlmFrames: [],
   };
+
+  if (captureState.smolVlmFrameCapture) {
+    captureState.smolVlmFrameCapture.stop();
+    captureState.smolVlmFrameCapture = null;
+  }
+  if (shouldCaptureSmolVlmFrames(effectiveConfig, stream)) {
+    startSmolVlmLiveFrameCapture(context, stream, segmentLengthMs)
+      .then((handle) => {
+        captureState.smolVlmFrameCapture = handle;
+      })
+      .catch((error) => {
+        console.warn("SmolVLM live frame capture unavailable; falling back to segment decode", error);
+      });
+  }
 
   recorder.addEventListener("start", () => {
     context.segmentStart = new Date();
     if (captureState.inference) {
       captureState.inference.resetSegment();
     }
+    context.smolVlmFrames = [];
   });
 
   recorder.addEventListener("dataavailable", (event) => {
@@ -1974,12 +2192,17 @@ async function startMediaCapture(session) {
     const end = new Date();
     context.segmentStart = end;
     const segmentIndex = context.segmentIndex;
+    const smolVlmFrames = Array.isArray(context.smolVlmFrames)
+      ? context.smolVlmFrames.slice()
+      : [];
+    context.smolVlmFrames = [];
     const uploadPromise = (async () => {
       const { detections, frameImages } = await getMobileDetections(
         event.data,
         start,
         end,
         segmentIndex,
+        { smolVlmFrames },
       );
       return uploadSegmentBlob(
         context.sessionId,
@@ -2361,6 +2584,11 @@ async function stopMediaCapture() {
   const context = captureState.context;
   if (!context) {
     return;
+  }
+
+  if (captureState.smolVlmFrameCapture) {
+    captureState.smolVlmFrameCapture.stop();
+    captureState.smolVlmFrameCapture = null;
   }
 
   if (captureState.inference) {
@@ -3016,7 +3244,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   renderDetectionLog();
   const config = getEffectiveConfig();
   preloadInferenceResources();
-  preloadSmolVlmModel(config.smolvlm_model_id);
+  if (!globalThis.BUURT_SKIP_SMOLVLM_PRELOAD) {
+    preloadSmolVlmModel(config.smolvlm_model_id);
+  }
   setStatus("Loading sessions…");
   await loadSessions();
   setupLiveUpdates();

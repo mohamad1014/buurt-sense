@@ -19,7 +19,7 @@ const TRANSFORMERS_WASM_BASE = "https://cdn.jsdelivr.net/npm/@huggingface/transf
 const SMOLVLM_DEFAULT_MODEL = "HuggingFaceTB/SmolVLM2-256M-Instruct";
 const SMOLVLM_VIDEO_MODEL = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct";
 const SMOLVLM_OPTIONS = {
-  frameCount: 4,
+  frameCount: 8,
   maxNewTokens: 192,
 };
 
@@ -144,7 +144,7 @@ async function preloadModel(modelId = SMOLVLM_DEFAULT_MODEL) {
   const runtime = await loadTransformersRuntime();
   const { AutoProcessor, AutoModelForVision2Seq, RawImage } = runtime;
   
-  const targetDevice = "wasm"; // Always use WASM in worker context
+  const targetDevice = "webgpu"; // Prefer WebGPU, fallback to WASM
   
   const loadForDevice = async (device) => {
     const processor = await AutoProcessor.from_pretrained(targetModelId);
@@ -160,8 +160,6 @@ async function preloadModel(modelId = SMOLVLM_DEFAULT_MODEL) {
       if (img.config) {
         img.config.do_image_splitting = false;
         img.config.do_image_splitting_layers = [];
-        img.config.image_size = { height: 224, width: 224 };
-        img.config.size = { height: 224, width: 224 };
       }
     }
     
@@ -254,18 +252,7 @@ async function describeFrames(payload) {
       return { text: null, latencyMs: null, device: modelArtifacts.device };
     }
     
-    // Stitch frames if needed
-    const finalFrames = await stitchFramesIfNeeded(processedFrames, modelArtifacts);
-    
-    const buildMessages = (frameList) => ([
-      {
-        role: "user",
-        content: [
-          ...frameList.map(() => ({ type: "image" })),
-          { type: "text", text: prompt || "These images are frames from a video in chronological order. Describe what happens in the video in detail." },
-        ],
-      },
-    ]);
+    const finalFrames = selectFrames(processedFrames, SMOLVLM_OPTIONS.frameCount);
     
     const decodeTokens = (tokenIds, tokenizer) => {
       if (!tokenIds || !tokenizer) {
@@ -283,8 +270,17 @@ async function describeFrames(payload) {
     };
     
     const buildInputs = async (frameList) => {
+      const messages = [
+        {
+          role: "user",
+          content: [
+            ...frameList.map(() => ({ type: "image" })),
+            { type: "text", text: prompt ?? "Describe what happens in the video." },
+          ],
+        },
+      ];
       const templated = modelArtifacts.processor.apply_chat_template(
-        buildMessages(frameList),
+        messages,
         { add_generation_prompt: true, tokenize: false },
       );
       return modelArtifacts.processor(
@@ -292,9 +288,7 @@ async function describeFrames(payload) {
         frameList,
         {
           return_tensors: "np",
-          return_row_col_info: false,
           do_image_splitting: false,
-          image_size: { height: 224, width: 224 },
         },
       );
     };
@@ -364,48 +358,24 @@ async function describeFrames(payload) {
   }
 }
 
-async function stitchFramesIfNeeded(frameList, modelArtifacts) {
-  if (!frameList || frameList.length <= 1) {
+function selectFrames(frameList, targetCount = SMOLVLM_OPTIONS.frameCount) {
+  if (!frameList?.length) {
+    return [];
+  }
+  
+  const count = Math.max(Math.min(targetCount || frameList.length, frameList.length), 1);
+  if (count === frameList.length) {
     return frameList;
   }
   
-  try {
-    const first = frameList[0];
-    const width = first.width ?? first.cols ?? 224;
-    const height = first.height ?? first.rows ?? 224;
-    
-    // Use OffscreenCanvas for stitching in worker context
-    const canvas = new OffscreenCanvas(width, frameList.length * height);
-    const ctx = canvas.getContext("2d");
-    if (!ctx) {
-      return [first];
-    }
-    
-    frameList.forEach((frame, index) => {
-      const data = frame.data instanceof Uint8ClampedArray
-        ? frame.data
-        : new Uint8ClampedArray(frame.data);
-      const imageData = new ImageData(data, width, height);
-      ctx.putImageData(imageData, 0, index * height);
-    });
-    
-    // Convert canvas to RawImage
-    let stitched;
-    if (typeof modelArtifacts.rawImageCtor.fromCanvas === "function") {
-      stitched = modelArtifacts.rawImageCtor.fromCanvas(canvas);
-    } else {
-      // Fallback: convert canvas to blob and create RawImage
-      const canvasBlob = await canvas.convertToBlob({ type: "image/png" });
-      if (typeof modelArtifacts.rawImageCtor.fromBlob === "function") {
-        stitched = modelArtifacts.rawImageCtor.fromBlob(canvasBlob);
-      }
-    }
-    
-    return stitched ? [stitched] : [first];
-  } catch (error) {
-    console.warn("Failed to stitch frames, using first frame only", error);
-    return [frameList[0]];
+  const selected = [];
+  const step = frameList.length / count;
+  for (let i = 0; i < count; i += 1) {
+    const index = Math.floor(i * step);
+    selected.push(frameList[index]);
   }
+  
+  return selected;
 }
 
 async function clearModel() {
