@@ -361,6 +361,9 @@ npm install
 
 # run expensive model checks (downloads models; needs network)
 RUN_MODEL_TESTS=1 npm run test:frontend
+
+# also run the browser harness in mobile emulation (Android + iOS profiles)
+RUN_MOBILE_UI_TESTS=1 npm run test:frontend
 ```
 
 ### Running Tests

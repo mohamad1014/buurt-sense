@@ -82,17 +82,78 @@ const smolVlmOptions = {
   maxNewTokens: 192,
 };
 const SMOLVLM_WORKER_TIMEOUT_MS = 180_000;
-const SMOLVLM_DEFAULT_PROMPT = "These images are frames from a video in chronological order from left to right. Describe what happens in the video in short.";
+const SMOLVLM_SINGLE_FRAME_PROMPT =
+  "This image is a frame from a video. Describe what you can see in 1-2 sentences. If no people are visible, say so. Only describe visible details.";
+const SMOLVLM_MULTI_FRAME_PROMPT =
+  "These images are frames from a video in chronological order. Describe what you can see (1-2 sentences). If no people are visible, say so. Only describe visible details.";
 const SMOLVLM_DEBUG_ENABLED =
   (typeof window !== "undefined" &&
     window.localStorage?.getItem("BUURT_DEBUG_SMOLVLM") === "1") ||
   false;
+const STATIC_ASSET_VERSION = (() => {
+  try {
+    const script = typeof document !== "undefined" ? document.currentScript : null;
+    if (!script?.src) {
+      return null;
+    }
+    const url = new URL(script.src, window.location.href);
+    return url.searchParams.get("v");
+  } catch {
+    return null;
+  }
+})();
 
 let smolVlmClient = null;
 let smolVlmWorkerClient = null;
 let smolVlmUnavailable = false;
 let smolVlmForcedFallback = false;
 let smolVlmQueue = Promise.resolve();
+
+function normalizeSmolVlmText(text) {
+  if (text == null) {
+    return null;
+  }
+  let cleaned = typeof text === "string" ? text : String(text);
+  cleaned = cleaned.trim();
+  if (!cleaned) {
+    return null;
+  }
+  const assistantMarker = "Assistant:";
+  const markerIndex = cleaned.lastIndexOf(assistantMarker);
+  if (markerIndex >= 0) {
+    cleaned = cleaned.slice(markerIndex + assistantMarker.length);
+  }
+  cleaned = cleaned.replace(/^\s*assistant\s*:\s*/i, "");
+  const userMarkerIndex = cleaned.indexOf("User:");
+  if (userMarkerIndex > 0) {
+    cleaned = cleaned.slice(0, userMarkerIndex);
+  }
+  cleaned = cleaned.trim();
+  return cleaned || null;
+}
+
+function smolVlmModelSupportsMultipleFrames(modelId) {
+  if (!modelId) {
+    return false;
+  }
+  return modelId === SMOLVLM_VIDEO_MODEL || String(modelId).toLowerCase().includes("video");
+}
+
+function buildSmolVlmPrompt(frameCount) {
+  return frameCount && frameCount > 1 ? SMOLVLM_MULTI_FRAME_PROMPT : SMOLVLM_SINGLE_FRAME_PROMPT;
+}
+
+function selectSmolVlmFramesForModel(frames, modelId) {
+  const frameList = Array.isArray(frames) ? frames : [];
+  if (!frameList.length) {
+    return [];
+  }
+  if (smolVlmModelSupportsMultipleFrames(modelId)) {
+    return frameList;
+  }
+  const mid = Math.floor(frameList.length / 2);
+  return [frameList[mid] || frameList[0]];
+}
 
 function getSmolVlmWorkerTimeoutMs() {
   const override = Number(globalThis.BUURT_SMOLVLM_WORKER_TIMEOUT_MS);
@@ -561,7 +622,7 @@ class SmolVlmClient {
   async describeVideoBlob(blob, options = {}) {
     const modelId = options.modelId || SMOLVLM_DEFAULT_MODEL;
     const frameCount = options.frameCount ?? smolVlmOptions.frameCount;
-    const prompt = options.prompt || "These images are frames from a video in chronological order. Describe what happens in the video in short.";
+    const prompt = options.prompt || SMOLVLM_DEFAULT_PROMPT;
     const includeImages = options.includeImages ?? false;
     const imageLabel = options.imageLabel || "smolvlm";
     let frames = [];
@@ -638,17 +699,69 @@ class SmolVlmClient {
         },
       ]);
 
-      const decodeTokens = (tokenIds, tokenizer) => {
-        if (!tokenIds || !tokenizer) {
+      const getInputTokenCount = (inputIds) => {
+        if (!inputIds) {
           return null;
         }
-        const sequences = Array.isArray(tokenIds) ? tokenIds : [tokenIds];
-        if (typeof tokenizer.batch_decode === "function") {
-          const decoded = tokenizer.batch_decode(sequences, { skip_special_tokens: true });
-          return Array.isArray(decoded) ? decoded[0] : decoded;
+        if (Array.isArray(inputIds)) {
+          const first = inputIds[0];
+          return Array.isArray(first) ? first.length : inputIds.length;
         }
+        if (ArrayBuffer.isView(inputIds)) {
+          return inputIds.length;
+        }
+        const dims = inputIds.dims || inputIds.shape;
+        if (Array.isArray(dims) && dims.length >= 2) {
+          return dims[dims.length - 1];
+        }
+        const data = inputIds.data;
+        if (ArrayBuffer.isView(data)) {
+          return data.length;
+        }
+        return null;
+      };
+
+      const getFirstSequenceTokenIds = (sequences) => {
+        if (!sequences) {
+          return null;
+        }
+        if (Array.isArray(sequences)) {
+          const first = sequences[0];
+          return Array.isArray(first) ? first : sequences;
+        }
+        if (ArrayBuffer.isView(sequences)) {
+          return sequences;
+        }
+        const data = sequences.data;
+        if (ArrayBuffer.isView(data)) {
+          return data;
+        }
+        if (typeof sequences.tolist === "function") {
+          try {
+            const list = sequences.tolist();
+            if (Array.isArray(list)) {
+              const first = list[0];
+              return Array.isArray(first) ? first : list;
+            }
+          } catch {
+            // ignore tensor conversion failures
+          }
+        }
+        return null;
+      };
+
+      const decodeTokenIds = (tokenIds) => {
+        if (!tokenIds || !modelArtifacts.processor?.tokenizer) {
+          return null;
+        }
+        const tokenizer = modelArtifacts.processor.tokenizer;
+        const ids = Array.isArray(tokenIds) ? tokenIds : Array.from(tokenIds);
         if (typeof tokenizer.decode === "function") {
-          return tokenizer.decode(sequences[0] ?? sequences, { skip_special_tokens: true });
+          return tokenizer.decode(ids, { skip_special_tokens: true });
+        }
+        if (typeof tokenizer.batch_decode === "function") {
+          const decoded = tokenizer.batch_decode([ids], { skip_special_tokens: true });
+          return Array.isArray(decoded) ? decoded[0] : decoded;
         }
         return null;
       };
@@ -688,8 +801,14 @@ class SmolVlmClient {
         });
         const latencyMs = Math.max(Math.round(performance.now() - start), 1);
         const sequences = generation?.sequences ?? generation;
-        const summary = decodeTokens(sequences, modelArtifacts.processor.tokenizer);
-        return { text: summary, latencyMs };
+        const tokenIds = getFirstSequenceTokenIds(sequences);
+        const inputTokenCount = getInputTokenCount(inputTensors?.input_ids);
+        const generatedTokenIds =
+          tokenIds && Number.isFinite(inputTokenCount) && inputTokenCount > 0 && tokenIds.length > inputTokenCount
+            ? tokenIds.slice(inputTokenCount)
+            : tokenIds;
+        const summary = decodeTokenIds(generatedTokenIds);
+        return { text: normalizeSmolVlmText(summary), latencyMs };
       };
 
       try {
@@ -1017,7 +1136,10 @@ class SmolVlmWorkerClient {
       return this.initPromise;
     }
     try {
-      this.worker = new Worker("/static/smolvlm.worker.js");
+      const workerUrl = STATIC_ASSET_VERSION
+        ? `/static/smolvlm.worker.js?v=${encodeURIComponent(STATIC_ASSET_VERSION)}`
+        : "/static/smolvlm.worker.js";
+      this.worker = new Worker(workerUrl);
     } catch (error) {
       console.warn("SmolVLM worker unavailable; falling back to main thread", error);
       return Promise.reject(error);
@@ -1105,6 +1227,7 @@ class SmolVlmWorkerClient {
     if (!frameList.length) {
       return { text: null, latencyMs: null, device: null };
     }
+    const resolvedFrameCount = options.frameCount ?? frameList.length;
     const payload = {
       frames: frameList.map((frame) => ({
         width: frame.width,
@@ -1112,7 +1235,8 @@ class SmolVlmWorkerClient {
         data: frame.data,
       })),
       modelId: options.modelId || SMOLVLM_DEFAULT_MODEL,
-      prompt: options.prompt || SMOLVLM_DEFAULT_PROMPT,
+      frameCount: resolvedFrameCount,
+      prompt: options.prompt || buildSmolVlmPrompt(resolvedFrameCount),
     };
     const transfer = frameList
       .map((frame) => frame.data?.buffer)
@@ -1121,10 +1245,11 @@ class SmolVlmWorkerClient {
   }
 
   async describeVideoBlob(blob, options = {}) {
-    const frames = await extractFramesForWorker(
+    const extracted = await extractFramesForWorker(
       blob,
       options.frameCount ?? smolVlmOptions.frameCount,
     );
+    const frames = selectSmolVlmFramesForModel(extracted, options.modelId || SMOLVLM_DEFAULT_MODEL);
     if (!frames.length) {
       return { text: null, latencyMs: null, device: null };
     }
@@ -1717,8 +1842,8 @@ async function runSmolVlmDetections(blob, startTs, endTs, index, config, options
   }
   const durationMs = computeSegmentDurationMs(startTs, endTs);
   const modelId = config.smolvlm_model_id || SMOLVLM_DEFAULT_MODEL;
-  const prompt = SMOLVLM_DEFAULT_PROMPT;
   const frameCount = smolVlmOptions.frameCount;
+  const frameCountForModel = smolVlmModelSupportsMultipleFrames(modelId) ? frameCount : 1;
   const frameLabel = `segment-${String(index).padStart(4, "0")}-smolvlm`;
   const providedFrames = Array.isArray(options.smolVlmFrames)
     ? options.smolVlmFrames
@@ -1741,26 +1866,29 @@ async function runSmolVlmDetections(blob, startTs, endTs, index, config, options
   try {
     const workerClient = getSmolVlmWorkerClient();
     workerClient.preload(modelId).catch(() => {});
-    const frames = providedFrames.length
+    const extractedFrames = providedFrames.length
       ? providedFrames
-      : await extractFramesForWorker(blob, frameCount);
-    if (!frames.length) {
+      : await extractFramesForWorker(blob, frameCountForModel);
+    const framesForInference = selectSmolVlmFramesForModel(extractedFrames, modelId);
+    const prompt = buildSmolVlmPrompt(framesForInference.length);
+    if (!framesForInference.length) {
       console.warn(
         `SmolVLM2 frame extraction returned empty frames for segment ${index}`,
         { type: blob?.type, size: blob?.size },
       );
     }
-    frameImages = await encodeFramesToPngBlobs(frames, {
+    frameImages = await encodeFramesToPngBlobs(extractedFrames, {
       label: frameLabel,
       stitch: true,
     });
-    const workerResult = await workerClient.describeFrames(frames, {
+    const workerResult = await workerClient.describeFrames(framesForInference, {
       modelId,
-      frameCount,
+      frameCount: framesForInference.length,
       prompt,
     });
-    if (workerResult?.text) {
-      const detection = buildDetection(workerResult);
+    const workerText = normalizeSmolVlmText(workerResult?.text);
+    if (workerText) {
+      const detection = buildDetection({ ...workerResult, text: workerText });
       appendDetectionsToLog([detection]);
       return { detections: [detection], frameImages };
     }
@@ -1773,16 +1901,17 @@ async function runSmolVlmDetections(blob, startTs, endTs, index, config, options
     const client = getSmolVlmClient();
     const result = await client.describeVideoBlob(blob, {
       modelId,
-      frameCount,
-      prompt,
+      frameCount: frameCountForModel,
+      prompt: buildSmolVlmPrompt(frameCountForModel),
       includeImages: true,
       imageLabel: frameLabel,
     });
     if (Array.isArray(result?.frameImages) && result.frameImages.length) {
       frameImages = result.frameImages;
     }
-    if (result?.text) {
-      const detection = buildDetection(result);
+    const cleanedText = normalizeSmolVlmText(result?.text);
+    if (cleanedText) {
+      const detection = buildDetection({ ...result, text: cleanedText });
       appendDetectionsToLog([detection]);
       return { detections: [detection], frameImages };
     }
@@ -1992,6 +2121,40 @@ async function buildSessionPayload() {
   const gpsOrigin = await resolveGpsOrigin(now, defaults);
   const orientationOrigin = await resolveOrientationOrigin(now, defaults);
   const config = updateConfigFromInputs();
+  const deviceInfo = (() => {
+    const nav = globalThis.navigator || {};
+    const scr = globalThis.screen || {};
+    const viewport = {
+      width: Number.isFinite(globalThis.innerWidth) ? globalThis.innerWidth : null,
+      height: Number.isFinite(globalThis.innerHeight) ? globalThis.innerHeight : null,
+      device_pixel_ratio: Number.isFinite(globalThis.devicePixelRatio)
+        ? globalThis.devicePixelRatio
+        : null,
+    };
+    const screenInfo = {
+      width: Number.isFinite(scr.width) ? scr.width : null,
+      height: Number.isFinite(scr.height) ? scr.height : null,
+      avail_width: Number.isFinite(scr.availWidth) ? scr.availWidth : null,
+      avail_height: Number.isFinite(scr.availHeight) ? scr.availHeight : null,
+    };
+    return {
+      user_agent: typeof nav.userAgent === "string" ? nav.userAgent : null,
+      platform: typeof nav.platform === "string" ? nav.platform : null,
+      vendor: typeof nav.vendor === "string" ? nav.vendor : null,
+      language: typeof nav.language === "string" ? nav.language : null,
+      languages: Array.isArray(nav.languages) ? nav.languages : null,
+      hardware_concurrency: Number.isFinite(nav.hardwareConcurrency)
+        ? nav.hardwareConcurrency
+        : null,
+      device_memory_gb: Number.isFinite(nav.deviceMemory) ? nav.deviceMemory : null,
+      cross_origin_isolated: Boolean(globalThis.crossOriginIsolated),
+      webgpu_available: Boolean(nav.gpu),
+      offscreen_canvas: typeof OffscreenCanvas !== "undefined",
+      viewport,
+      screen: screenInfo,
+      static_asset_version: STATIC_ASSET_VERSION,
+    };
+  })();
 
   return {
     started_at: now.toISOString(),
@@ -1999,12 +2162,19 @@ async function buildSessionPayload() {
     notes: "Started from local UI",
     app_version: "web-ui",
     model_bundle_version: "demo",
+    device_info: deviceInfo,
     gps_origin: gpsOrigin,
     orientation_origin: orientationOrigin,
     config_snapshot: {
       segment_length_sec: config.segment_length_sec,
       overlap_sec: config.overlap_sec,
       confidence_threshold: config.confidence_threshold,
+      inference_method: config.inference_method,
+      smolvlm_model_id: config.smolvlm_model_id,
+      audio_inference_enabled: config.audio_inference_enabled,
+      video_inference_enabled: config.video_inference_enabled,
+      smolvlm_frame_count: smolVlmOptions.frameCount,
+      smolvlm_max_new_tokens: smolVlmOptions.maxNewTokens,
     },
     detection_summary: {
       total_detections: 0,

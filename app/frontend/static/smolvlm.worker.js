@@ -23,6 +23,29 @@ const SMOLVLM_OPTIONS = {
   maxNewTokens: 192,
 };
 
+function normalizeSmolVlmText(text) {
+  if (text == null) {
+    return null;
+  }
+  let cleaned = typeof text === "string" ? text : String(text);
+  cleaned = cleaned.trim();
+  if (!cleaned) {
+    return null;
+  }
+  const assistantMarker = "Assistant:";
+  const markerIndex = cleaned.lastIndexOf(assistantMarker);
+  if (markerIndex >= 0) {
+    cleaned = cleaned.slice(markerIndex + assistantMarker.length);
+  }
+  cleaned = cleaned.replace(/^\s*assistant\s*:\s*/i, "");
+  const userMarkerIndex = cleaned.indexOf("User:");
+  if (userMarkerIndex > 0) {
+    cleaned = cleaned.slice(0, userMarkerIndex);
+  }
+  cleaned = cleaned.trim();
+  return cleaned || null;
+}
+
 // Message handlers
 globalScope.addEventListener("message", async (event) => {
   const { id, type, payload } = event.data || {};
@@ -144,7 +167,8 @@ async function preloadModel(modelId = SMOLVLM_DEFAULT_MODEL) {
   const runtime = await loadTransformersRuntime();
   const { AutoProcessor, AutoModelForVision2Seq, RawImage } = runtime;
   
-  const targetDevice = "webgpu"; // Prefer WebGPU, fallback to WASM
+  const userAgent = globalScope.navigator?.userAgent || "";
+  const targetDevice = /\bAndroid\b/i.test(userAgent) ? "wasm" : "webgpu";
   
   const loadForDevice = async (device) => {
     const processor = await AutoProcessor.from_pretrained(targetModelId);
@@ -160,6 +184,8 @@ async function preloadModel(modelId = SMOLVLM_DEFAULT_MODEL) {
       if (img.config) {
         img.config.do_image_splitting = false;
         img.config.do_image_splitting_layers = [];
+        img.config.image_size = { height: 224, width: 224 };
+        img.config.size = { height: 224, width: 224 };
       }
     }
     
@@ -212,6 +238,103 @@ async function describeFrames(payload) {
       return { text: null, latencyMs: null, device: modelArtifacts?.device ?? null };
     }
     
+    const getInputTokenCount = (inputIds) => {
+      if (!inputIds) {
+        return null;
+      }
+      if (Array.isArray(inputIds)) {
+        const first = inputIds[0];
+        return Array.isArray(first) ? first.length : inputIds.length;
+      }
+      if (ArrayBuffer.isView(inputIds)) {
+        return inputIds.length;
+      }
+      const dims = inputIds.dims || inputIds.shape;
+      if (Array.isArray(dims) && dims.length >= 2) {
+        return dims[dims.length - 1];
+      }
+      const data = inputIds.data;
+      if (ArrayBuffer.isView(data)) {
+        return data.length;
+      }
+      return null;
+    };
+
+    const getFirstSequenceTokenIds = (sequences) => {
+      if (!sequences) {
+        return null;
+      }
+      if (Array.isArray(sequences)) {
+        const first = sequences[0];
+        return Array.isArray(first) ? first : sequences;
+      }
+      if (ArrayBuffer.isView(sequences)) {
+        return sequences;
+      }
+      const data = sequences.data;
+      if (ArrayBuffer.isView(data)) {
+        return data;
+      }
+      if (typeof sequences.tolist === "function") {
+        try {
+          const list = sequences.tolist();
+          if (Array.isArray(list)) {
+            const first = list[0];
+            return Array.isArray(first) ? first : list;
+          }
+        } catch {
+          // ignore tensor conversion failures
+        }
+      }
+      return null;
+    };
+
+    const decodeTokenIds = (tokenIds, tokenizer) => {
+      if (!tokenIds || !tokenizer) {
+        return null;
+      }
+      const ids = Array.isArray(tokenIds) ? tokenIds : Array.from(tokenIds);
+      if (typeof tokenizer.decode === "function") {
+        return tokenizer.decode(ids, { skip_special_tokens: true });
+      }
+      if (typeof tokenizer.batch_decode === "function") {
+        const decoded = tokenizer.batch_decode([ids], { skip_special_tokens: true });
+        return Array.isArray(decoded) ? decoded[0] : decoded;
+      }
+      return null;
+    };
+
+    let scratchCanvas = null;
+    let scratchCtx = null;
+    let scratchWidth = 0;
+    let scratchHeight = 0;
+    const ensureScratchCanvas = (width, height) => {
+      if (
+        scratchCanvas &&
+        scratchCtx &&
+        scratchWidth === width &&
+        scratchHeight === height
+      ) {
+        return scratchCtx;
+      }
+      if (typeof OffscreenCanvas === "undefined") {
+        return null;
+      }
+      try {
+        scratchCanvas = new OffscreenCanvas(width, height);
+        scratchCtx = scratchCanvas.getContext("2d");
+        scratchWidth = width;
+        scratchHeight = height;
+        return scratchCtx;
+      } catch {
+        scratchCanvas = null;
+        scratchCtx = null;
+        scratchWidth = 0;
+        scratchHeight = 0;
+        return null;
+      }
+    };
+
     // Convert frame data to RawImage objects
     const processedFrames = [];
     for (const frameData of frames) {
@@ -228,16 +351,15 @@ async function describeFrames(payload) {
         
         // Convert to RawImage
         let rawImage;
-        if (typeof modelArtifacts.rawImageCtor.fromImageData === "function") {
-          rawImage = modelArtifacts.rawImageCtor.fromImageData(imageData);
-        } else if (typeof modelArtifacts.rawImageCtor.fromCanvas === "function") {
-          // Create a temporary canvas to convert ImageData
-          const canvas = new OffscreenCanvas(width, height);
-          const ctx = canvas.getContext("2d");
-          if (ctx) {
+        if (typeof modelArtifacts.rawImageCtor.fromCanvas === "function") {
+          const ctx = ensureScratchCanvas(width, height);
+          if (ctx && scratchCanvas) {
             ctx.putImageData(imageData, 0, 0);
-            rawImage = modelArtifacts.rawImageCtor.fromCanvas(canvas);
+            rawImage = modelArtifacts.rawImageCtor.fromCanvas(scratchCanvas);
           }
+        }
+        if (!rawImage && typeof modelArtifacts.rawImageCtor.fromImageData === "function") {
+          rawImage = modelArtifacts.rawImageCtor.fromImageData(imageData);
         }
         
         if (rawImage) {
@@ -252,22 +374,7 @@ async function describeFrames(payload) {
       return { text: null, latencyMs: null, device: modelArtifacts.device };
     }
     
-    const finalFrames = selectFrames(processedFrames, SMOLVLM_OPTIONS.frameCount);
-    
-    const decodeTokens = (tokenIds, tokenizer) => {
-      if (!tokenIds || !tokenizer) {
-        return null;
-      }
-      const sequences = Array.isArray(tokenIds) ? tokenIds : [tokenIds];
-      if (typeof tokenizer.batch_decode === "function") {
-        const decoded = tokenizer.batch_decode(sequences, { skip_special_tokens: true });
-        return Array.isArray(decoded) ? decoded[0] : decoded;
-      }
-      if (typeof tokenizer.decode === "function") {
-        return tokenizer.decode(sequences[0] ?? sequences, { skip_special_tokens: true });
-      }
-      return null;
-    };
+    const finalFrames = selectFrames(processedFrames, payload?.frameCount ?? SMOLVLM_OPTIONS.frameCount);
     
     const buildInputs = async (frameList) => {
       const messages = [
@@ -288,7 +395,9 @@ async function describeFrames(payload) {
         frameList,
         {
           return_tensors: "np",
+          return_row_col_info: false,
           do_image_splitting: false,
+          image_size: { height: 224, width: 224 },
         },
       );
     };
@@ -310,8 +419,17 @@ async function describeFrames(payload) {
       });
       const latencyMs = Math.max(Math.round(performance.now() - start), 1);
       const sequences = generation?.sequences ?? generation;
-      const summary = decodeTokens(sequences, modelArtifacts.processor.tokenizer);
-      return { text: summary, latencyMs };
+      const tokenIds = getFirstSequenceTokenIds(sequences);
+      const inputTokenCount = getInputTokenCount(inputTensors?.input_ids);
+      const generatedTokenIds =
+        tokenIds &&
+        Number.isFinite(inputTokenCount) &&
+        inputTokenCount > 0 &&
+        tokenIds.length > inputTokenCount
+          ? tokenIds.slice(inputTokenCount)
+          : tokenIds;
+      const summary = decodeTokenIds(generatedTokenIds, modelArtifacts.processor.tokenizer);
+      return { text: normalizeSmolVlmText(summary), latencyMs };
     };
     
     try {
