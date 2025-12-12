@@ -77,17 +77,20 @@ const SMOLVLM_VIDEO_MODEL = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct";
 const TRANSFORMERS_WASM_BASE =
   "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/dist/";
 const smolVlmOptions = {
-  frameCount: 4,
+  frameCount: 8,
   maxNewTokens: 192,
 };
+const SMOLVLM_DEFAULT_PROMPT = "These images are frames from a video in chronological order from left to right. Describe what happens in the video in short.";
 const SMOLVLM_DEBUG_ENABLED =
   (typeof window !== "undefined" &&
     window.localStorage?.getItem("BUURT_DEBUG_SMOLVLM") === "1") ||
   false;
 
 let smolVlmClient = null;
+let smolVlmWorkerClient = null;
 let smolVlmUnavailable = false;
 let smolVlmForcedFallback = false;
+let smolVlmQueue = Promise.resolve();
 
 class InferenceWorkerBridge {
   constructor(config) {
@@ -310,8 +313,8 @@ class SmolVlmClient {
       if (runtime?.env) {
         runtime.env.allowLocalModels = false;
         runtime.env.allowRemoteModels = true;
-        // Disable Cache API usage to avoid quota/driver errors seen on some browsers.
-        runtime.env.useCache = false;
+        // Enable caching so subsequent inferences reuse already downloaded weights.
+        runtime.env.useCache = true;
         runtime.env.useBrowserCache = false;
         runtime.env.useFSCache = false;
         if (runtime.env.backends?.onnx?.wasm) {
@@ -484,8 +487,9 @@ class SmolVlmClient {
 
     const frames = [];
     const safeFrameCount = Math.max(Math.min(frameCount, 32), 1);
-    for (let i = 0; i < safeFrameCount; i++) {
-      const t = safeFrameCount === 1 ? duration / 2 : (duration * i) / (safeFrameCount - 1);
+    const sampleCount = safeFrameCount + 1; // skip the first near-zero frame
+    for (let i = 1; i <= safeFrameCount; i++) {
+      const t = sampleCount === 1 ? duration / 2 : (duration * i) / sampleCount;
       try {
         await this.seekVideo(video, Math.min(t, duration));
         ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
@@ -536,10 +540,25 @@ class SmolVlmClient {
   async describeVideoBlob(blob, options = {}) {
     const modelId = options.modelId || SMOLVLM_DEFAULT_MODEL;
     const frameCount = options.frameCount ?? smolVlmOptions.frameCount;
-    const prompt = options.prompt || "These images are frames from a video in chronological order. Describe what happens in the video in detail.";
+    const prompt = options.prompt || "These images are frames from a video in chronological order. Describe what happens in the video in short.";
+    const includeImages = options.includeImages ?? false;
+    const imageLabel = options.imageLabel || "smolvlm";
     let frames = [];
+    let framesForUpload = [];
+    let frameImages = [];
     let modelArtifacts;
     let capturedFrames = [];
+
+    const maybeCaptureFrames = async () => {
+      if (!includeImages || frameImages.length || !framesForUpload.length) {
+        return;
+      }
+      frameImages = await encodeFramesToPngBlobs(framesForUpload, {
+        label: imageLabel,
+        stitch: framesForUpload.length > 1,
+      });
+    };
+
     try {
       [frames, modelArtifacts] = await Promise.all([
         this.extractFramesFromBlob(blob, frameCount),
@@ -555,7 +574,8 @@ class SmolVlmClient {
       capturedFrames = usableFrames;
 
       if (!frames.length || !modelArtifacts?.processor || !modelArtifacts?.model) {
-        return { text: null, latencyMs: null, device: modelArtifacts?.device ?? null };
+        await maybeCaptureFrames();
+        return { text: null, latencyMs: null, device: modelArtifacts?.device ?? null, frameImages };
       }
 
       const stitchFramesIfNeeded = async (frameList) => {
@@ -584,6 +604,7 @@ class SmolVlmClient {
       };
 
       frames = await stitchFramesIfNeeded(frames);
+      framesForUpload = frames;
       exportFramesForDebug(frames, "smolvlm-stitched");
 
       const buildMessages = (frameList) => ([
@@ -635,6 +656,7 @@ class SmolVlmClient {
         console.warn("SmolVLM2 processor failed; retrying with a single frame", error);
         const fallbackFrame = frames[Math.floor(frames.length / 2)] ?? frames[0];
         frames = [fallbackFrame];
+        framesForUpload = frames;
         inputs = await buildInputs(frames);
       }
       const runGeneration = async (inputTensors) => {
@@ -651,10 +673,12 @@ class SmolVlmClient {
 
       try {
         const { text, latencyMs } = await runGeneration(inputs);
+        await maybeCaptureFrames();
         return {
           text,
           latencyMs,
           device: modelArtifacts.device,
+          frameImages,
         };
       } catch (generationError) {
         const message = generationError?.message || String(generationError);
@@ -665,31 +689,38 @@ class SmolVlmClient {
           try {
             const singleInputs = await buildInputs([fallbackFrame]);
             frames = [fallbackFrame];
+            framesForUpload = frames;
             const { text, latencyMs } = await runGeneration(singleInputs);
+            await maybeCaptureFrames();
             return {
               text,
               latencyMs,
               device: modelArtifacts.device,
+              frameImages,
             };
           } catch (retryError) {
             console.warn("SmolVLM2 retry after mismatch failed", retryError);
           }
         }
         console.warn("SmolVLM2 generation failed", generationError);
+        await maybeCaptureFrames();
         return {
           text: null,
           latencyMs: null,
           device: modelArtifacts.device,
           error: message,
+          frameImages,
         };
       }
     } catch (fatalError) {
       console.warn("SmolVLM2 describeVideoBlob failed", fatalError);
+      await maybeCaptureFrames();
       return {
         text: null,
         latencyMs: null,
         device: modelArtifacts?.device ?? null,
         error: fatalError?.message || String(fatalError),
+        frameImages,
       };
     } finally {
       capturedFrames.forEach((frame) => {
@@ -716,6 +747,215 @@ function getSmolVlmClient() {
     smolVlmClient = new SmolVlmClient();
   }
   return smolVlmClient;
+}
+
+async function seekVideoElement(video, timestamp) {
+  if (!Number.isFinite(timestamp)) {
+    return;
+  }
+  if (Math.abs(video.currentTime - timestamp) < 0.01) {
+    return;
+  }
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      video.removeEventListener("seeked", onSeeked);
+      video.removeEventListener("error", onError);
+    };
+    const onSeeked = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    const onError = (event) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(event?.error || new Error("Video seek failed"));
+    };
+    video.addEventListener("seeked", onSeeked, { once: true });
+    video.addEventListener("error", onError, { once: true });
+    try {
+      video.currentTime = Math.max(timestamp, 0);
+    } catch (error) {
+      cleanup();
+      reject(error);
+    }
+  });
+}
+
+async function extractFramesForWorker(blob, frameCount = smolVlmOptions.frameCount) {
+  if (!blob) {
+    return [];
+  }
+  const url = URL.createObjectURL(blob);
+  const video = document.createElement("video");
+  video.src = url;
+  video.muted = true;
+  video.playsInline = true;
+  video.preload = "auto";
+  video.crossOrigin = "anonymous";
+
+  try {
+    await new Promise((resolve, reject) => {
+      video.onloadedmetadata = () => resolve(true);
+      video.onerror = () => reject(new Error("Failed to load video for SmolVLM2 worker"));
+    });
+  } catch (error) {
+    URL.revokeObjectURL(url);
+    return [];
+  }
+
+  const duration = Number.isFinite(video.duration) && video.duration > 0
+    ? video.duration
+    : 1;
+  const sourceWidth = video.videoWidth || 320;
+  const sourceHeight = video.videoHeight || 320;
+  const maxDim = 384;
+  const scale = Math.min(maxDim / Math.max(sourceWidth, sourceHeight), 1);
+  const targetWidth = Math.max(Math.round(sourceWidth * scale), 1);
+  const targetHeight = Math.max(Math.round(sourceHeight * scale), 1);
+  const canvas = document.createElement("canvas");
+  canvas.width = targetWidth;
+  canvas.height = targetHeight;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) {
+    URL.revokeObjectURL(url);
+    return [];
+  }
+
+  const frames = [];
+  const safeFrameCount = Math.max(Math.min(frameCount, 32), 1);
+  const sampleCount = safeFrameCount + 1; // skip the first near-zero frame
+  for (let i = 1; i <= safeFrameCount; i++) {
+    const t = sampleCount === 1 ? duration / 2 : (duration * i) / sampleCount;
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      await seekVideoElement(video, Math.min(t, duration));
+      ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
+      const imageData = ctx.getImageData(0, 0, targetWidth, targetHeight);
+      frames.push({
+        width: targetWidth,
+        height: targetHeight,
+        data: new Uint8ClampedArray(imageData.data),
+      });
+    } catch (error) {
+      console.warn("Failed to sample frame for SmolVLM2 worker", error);
+    }
+  }
+
+  URL.revokeObjectURL(url);
+  return frames;
+}
+
+class SmolVlmWorkerClient {
+  constructor() {
+    this.worker = null;
+    this.requests = new Map();
+    this.nextId = 1;
+    this.initPromise = null;
+  }
+
+  ensureWorker() {
+    if (this.worker) {
+      return this.initPromise;
+    }
+    try {
+      this.worker = new Worker("/static/smolvlm.worker.js");
+    } catch (error) {
+      console.warn("SmolVLM worker unavailable; falling back to main thread", error);
+      return Promise.reject(error);
+    }
+    this.worker.onmessage = (event) => {
+      const message = event.data || {};
+      const pending = this.requests.get(message.id);
+      if (!pending) {
+        return;
+      }
+      this.requests.delete(message.id);
+      if (message.success) {
+        pending.resolve(message.result);
+      } else {
+        pending.reject(new Error(message.error || "SmolVLM worker error"));
+      }
+    };
+    this.worker.onerror = (event) => {
+      console.error("SmolVLM worker error", event);
+    };
+    this.initPromise = this.postMessage("INIT");
+    return this.initPromise;
+  }
+
+  async postMessage(type, payload = null, transfer = []) {
+    if (!this.worker) {
+      await this.ensureWorker();
+    }
+    await this.initPromise;
+    const id = this.nextId++;
+    const promise = new Promise((resolve, reject) => {
+      this.requests.set(id, { resolve, reject });
+    });
+    try {
+      this.worker.postMessage({ id, type, payload }, transfer);
+    } catch (error) {
+      this.requests.delete(id);
+      throw error;
+    }
+    return promise;
+  }
+
+  preload(modelId) {
+    return this.postMessage("PRELOAD", { modelId });
+  }
+
+  async describeFrames(frames, options = {}) {
+    const frameList = Array.isArray(frames) ? frames : [];
+    if (!frameList.length) {
+      return { text: null, latencyMs: null, device: null };
+    }
+    const payload = {
+      frames: frameList.map((frame) => ({
+        width: frame.width,
+        height: frame.height,
+        data: frame.data,
+      })),
+      modelId: options.modelId || SMOLVLM_DEFAULT_MODEL,
+      prompt: options.prompt || SMOLVLM_DEFAULT_PROMPT,
+    };
+    const transfer = frameList
+      .map((frame) => frame.data?.buffer)
+      .filter((buf) => buf instanceof ArrayBuffer);
+    return this.postMessage("DESCRIBE_FRAMES", payload, transfer);
+  }
+
+  async describeVideoBlob(blob, options = {}) {
+    const frames = await extractFramesForWorker(
+      blob,
+      options.frameCount ?? smolVlmOptions.frameCount,
+    );
+    if (!frames.length) {
+      return { text: null, latencyMs: null, device: null };
+    }
+    return this.describeFrames(frames, options);
+  }
+
+  terminate() {
+    if (this.worker) {
+      this.worker.terminate();
+      this.worker = null;
+    }
+    this.requests.clear();
+    this.nextId = 1;
+    this.initPromise = null;
+  }
+}
+
+function getSmolVlmWorkerClient() {
+  if (!smolVlmWorkerClient) {
+    smolVlmWorkerClient = new SmolVlmWorkerClient();
+  }
+  return smolVlmWorkerClient;
 }
 
 const DEFAULT_CONFIG = {
@@ -1280,51 +1520,77 @@ async function fetchJson(url, options) {
 }
 
 async function runSmolVlmDetections(blob, startTs, endTs, index, config) {
+  const emptyResult = { detections: [], frameImages: [] };
   if (!config.video_inference_enabled || smolVlmUnavailable) {
-    return [];
+    return emptyResult;
   }
   const durationMs = computeSegmentDurationMs(startTs, endTs);
+  const modelId = config.smolvlm_model_id || SMOLVLM_DEFAULT_MODEL;
+  const prompt = SMOLVLM_DEFAULT_PROMPT;
+  const frameCount = smolVlmOptions.frameCount;
+  const frameLabel = `segment-${String(index).padStart(4, "0")}-smolvlm`;
+  let frameImages = [];
+
+  // Ensure model is warmed up once; reuse across segments.
+  preloadSmolVlmModel(modelId).catch(() => {});
+
+  const buildDetection = (result) => ({
+    class: result.text,
+    confidence: 1,
+    timestamp: endTs.toISOString(),
+    model_id: `${modelId}${result.device ? `@${result.device}` : ""}`,
+    inference_time_ms: result.latencyMs ?? null,
+    segment_duration_ms: durationMs,
+    index,
+  });
+
+  try {
+    const workerClient = getSmolVlmWorkerClient();
+    workerClient.preload(modelId).catch(() => {});
+    const frames = await extractFramesForWorker(blob, frameCount);
+    frameImages = await encodeFramesToPngBlobs(frames, {
+      label: frameLabel,
+      stitch: true,
+    });
+    const workerResult = await workerClient.describeFrames(frames, {
+      modelId,
+      frameCount,
+      prompt,
+    });
+    if (workerResult?.text) {
+      const detection = buildDetection(workerResult);
+      appendDetectionsToLog([detection]);
+      return { detections: [detection], frameImages };
+    }
+    console.warn("SmolVLM2 worker returned no summary");
+  } catch (error) {
+    console.warn("SmolVLM2 worker inference failed; retrying on main thread", error);
+  }
+
   try {
     const client = getSmolVlmClient();
     const result = await client.describeVideoBlob(blob, {
-      modelId: config.smolvlm_model_id || SMOLVLM_DEFAULT_MODEL,
-      frameCount: smolVlmOptions.frameCount,
+      modelId,
+      frameCount,
+      prompt,
+      includeImages: true,
+      imageLabel: frameLabel,
     });
-    if (!result?.text) {
-      console.warn("SmolVLM2 returned no summary");
-      return [];
+    if (Array.isArray(result?.frameImages) && result.frameImages.length) {
+      frameImages = result.frameImages;
     }
-    const detection = {
-      class: result.text,
-      confidence: 1,
-      timestamp: endTs.toISOString(),
-      model_id: `${config.smolvlm_model_id}${result.device ? `@${result.device}` : ""}`,
-      inference_time_ms: result.latencyMs ?? null,
-      segment_duration_ms: durationMs,
-      index,
-    };
-    appendDetectionsToLog([detection]);
-    return [detection];
+    if (result?.text) {
+      const detection = buildDetection(result);
+      appendDetectionsToLog([detection]);
+      return { detections: [detection], frameImages };
+    }
+    console.warn("SmolVLM2 returned no summary");
   } catch (error) {
-    const message = error?.message || String(error || "");
-    const isOrtRuntimeError = message.includes("107891176") || /^\d+$/.test(message.trim());
-    if (isOrtRuntimeError) {
-      console.warn("SmolVLM2 runtime error; keeping SmolVLM enabled but skipping segment", error);
-      return [];
-    }
-    disableSmolVlm("SmolVLM2 inference failed; switching to legacy worker", error);
-    const context = captureState.context;
-    if (!captureState.inference && context?.stream && context.segmentLengthMs) {
-      startLiveInference(context.stream, context.segmentLengthMs)
-        .then((inference) => {
-          captureState.inference = inference;
-        })
-        .catch((err) => {
-          console.warn("Failed to spin up legacy inference after SmolVLM failure", err);
-        });
-    }
-    return runLegacyWorkerDetections(blob, startTs, endTs, index, config);
+    console.warn("SmolVLM2 main-thread inference failed; using legacy worker for this segment", error);
   }
+
+  const legacyDetections = await runLegacyWorkerDetections(blob, startTs, endTs, index, config);
+  return { detections: legacyDetections, frameImages };
 }
 
 async function runLegacyWorkerDetections(blob, startTs, endTs, index, config) {
@@ -1400,18 +1666,52 @@ async function getMobileDetections(blob, startTs, endTs, index) {
     config.inference_method = INFERENCE_METHODS.WORKER;
   }
   if (config.inference_method === INFERENCE_METHODS.SMOLVLM) {
-    return runSmolVlmDetections(blob, startTs, endTs, index, config);
+    const task = async () =>
+      runSmolVlmDetections(blob, startTs, endTs, index, config);
+    smolVlmQueue = smolVlmQueue
+      .catch(() => {
+        // Reset a broken queue before scheduling the next task.
+        return undefined;
+      })
+      .then(task);
+    return smolVlmQueue.catch((error) => {
+      console.warn("SmolVLM queue failed", error);
+      return { detections: [], frameImages: [] };
+    });
   }
-  return runLegacyWorkerDetections(blob, startTs, endTs, index, config);
+  const detections = await runLegacyWorkerDetections(
+    blob,
+    startTs,
+    endTs,
+    index,
+    config,
+  );
+  return { detections, frameImages: [] };
 }
 
 async function preloadSmolVlmModel(modelId, attempts = 3) {
-  const smolClient = getSmolVlmClient();
-  smolClient.preload();
   const targetModelId = modelId || SMOLVLM_DEFAULT_MODEL;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
+      const workerClient = getSmolVlmWorkerClient();
+      await workerClient.preload(targetModelId);
+      markSmolVlmReady();
+      return true;
+    } catch (error) {
+      console.warn(`SmolVLM2 worker preload attempt ${attempt} failed`, error);
+      if (attempt === attempts) {
+        break;
+      }
+      await waitForMs(750 * attempt);
+    }
+  }
+
+  const smolClient = getSmolVlmClient();
+  smolClient.preload();
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
       await smolClient.ensureModel(targetModelId);
+      markSmolVlmReady();
       return true;
     } catch (error) {
       console.warn(`SmolVLM2 preload attempt ${attempt} failed`, error);
@@ -1675,7 +1975,7 @@ async function startMediaCapture(session) {
     context.segmentStart = end;
     const segmentIndex = context.segmentIndex;
     const uploadPromise = (async () => {
-      const detections = await getMobileDetections(
+      const { detections, frameImages } = await getMobileDetections(
         event.data,
         start,
         end,
@@ -1688,6 +1988,7 @@ async function startMediaCapture(session) {
         end,
         event.data,
         detections,
+        frameImages,
       );
     })();
     captureState.uploads.push(uploadPromise);
@@ -2102,6 +2403,7 @@ async function uploadSegmentBlob(
   endTs,
   blob,
   detections = null,
+  frameImages = [],
 ) {
   const formData = new FormData();
   formData.append("index", String(index));
@@ -2115,6 +2417,17 @@ async function uploadSegmentBlob(
 
   if (detections && detections.length) {
     formData.append("detections", JSON.stringify(detections));
+  }
+
+  if (Array.isArray(frameImages) && frameImages.length) {
+    frameImages.forEach((image, frameIndex) => {
+      if (!image?.blob) {
+        return;
+      }
+      const filename =
+        image.filename || `frame-${String(frameIndex).padStart(4, "0")}.png`;
+      formData.append("frames", image.blob, filename);
+    });
   }
 
   const response = await fetch(`/sessions/${sessionId}/segments/upload`, {
@@ -2259,6 +2572,128 @@ function exportFramesForDebug(frames, label = "smolvlm") {
       console.warn("Failed to export SmolVLM debug frame", error);
     }
   });
+}
+
+function frameToImageData(frame) {
+  if (!frame) {
+    return null;
+  }
+  const width = frame.width ?? frame.cols;
+  const height = frame.height ?? frame.rows;
+  const raw = frame.data instanceof Uint8ClampedArray
+    ? frame.data
+    : frame?.data
+      ? new Uint8ClampedArray(frame.data)
+      : null;
+  if (!Number.isFinite(width) || !Number.isFinite(height) || !raw) {
+    return null;
+  }
+  return new ImageData(raw, width, height);
+}
+
+function createCanvasSurface(width, height) {
+  const safeWidth = Math.max(Math.round(width), 1);
+  const safeHeight = Math.max(Math.round(height), 1);
+  if (typeof OffscreenCanvas === "function") {
+    return new OffscreenCanvas(safeWidth, safeHeight);
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width = safeWidth;
+  canvas.height = safeHeight;
+  return canvas;
+}
+
+async function canvasToPngBlob(canvas) {
+  if (typeof canvas.convertToBlob === "function") {
+    return canvas.convertToBlob({ type: "image/png" });
+  }
+  return new Promise((resolve) => {
+    if (typeof canvas.toBlob === "function") {
+      canvas.toBlob((blob) => resolve(blob), "image/png");
+    } else {
+      resolve(null);
+    }
+  });
+}
+
+async function encodeFramesToPngBlobs(frames, options = {}) {
+  const label = options.label || "smolvlm";
+  const stitch = options.stitch ?? false;
+  if (!Array.isArray(frames) || !frames.length) {
+    return [];
+  }
+  const timestamp = Date.now();
+  try {
+    if (stitch && frames.length > 1) {
+      const firstImage = frameToImageData(frames[0]);
+      if (!firstImage) {
+        return [];
+      }
+      const maxLongestSide = 1024;
+      const baseWidth = firstImage.width;
+      const baseHeight = firstImage.height;
+      const rawWidth = baseWidth * frames.length;
+      const scale = rawWidth > maxLongestSide ? maxLongestSide / rawWidth : 1;
+      const frameWidth = Math.max(Math.round(baseWidth * scale), 1);
+      const frameHeight = Math.max(Math.round(baseHeight * scale), 1);
+      const canvasWidth = Math.max(Math.round(rawWidth * scale), 1);
+      const canvasHeight = frameHeight;
+      const canvas = createCanvasSurface(canvasWidth, canvasHeight);
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        return [];
+      }
+      frames.forEach((frame, index) => {
+        const imageData = frameToImageData(frame);
+        if (!imageData) {
+          return;
+        }
+        const frameCanvas = createCanvasSurface(imageData.width, imageData.height);
+        const frameCtx = frameCanvas.getContext("2d");
+        if (!frameCtx) {
+          return;
+        }
+        frameCtx.putImageData(imageData, 0, 0);
+        const offsetX = index * frameWidth;
+        ctx.drawImage(frameCanvas, offsetX, 0, frameWidth, frameHeight);
+      });
+      const stitchedBlob = await canvasToPngBlob(canvas);
+      if (!stitchedBlob) {
+        return [];
+      }
+      return [
+        {
+          blob: stitchedBlob,
+          filename: `${label}-${timestamp}-stitched.png`,
+        },
+      ];
+    }
+    const encoded = [];
+    for (let i = 0; i < frames.length; i++) {
+      const imageData = frameToImageData(frames[i]);
+      if (!imageData) {
+        continue;
+      }
+      const canvas = createCanvasSurface(imageData.width, imageData.height);
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        continue;
+      }
+      ctx.putImageData(imageData, 0, 0);
+      // eslint-disable-next-line no-await-in-loop
+      const blob = await canvasToPngBlob(canvas);
+      if (blob) {
+        encoded.push({
+          blob,
+          filename: `${label}-${timestamp}-${String(i).padStart(4, "0")}.png`,
+        });
+      }
+    }
+    return encoded;
+  } catch (error) {
+    console.warn("Failed to encode SmolVLM frames for upload", error);
+    return [];
+  }
 }
 
 async function fetchModelFromCache(url) {
@@ -2565,6 +3000,10 @@ function cleanupLiveUpdates() {
   if (inferenceWorkerBridge) {
     inferenceWorkerBridge.terminate();
     inferenceWorkerBridge = null;
+  }
+  if (smolVlmWorkerClient) {
+    smolVlmWorkerClient.terminate();
+    smolVlmWorkerClient = null;
   }
 }
 

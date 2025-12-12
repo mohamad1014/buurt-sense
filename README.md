@@ -10,6 +10,7 @@ AI-powered neighbourhood awareness platform. Empowers communities to record and 
 - ✅ **Pydantic session model** that enforces timezone-aware timestamps (`app/models.py`).
 - ✅ **Comprehensive pytest suite** covering the session lifecycle and error handling (`tests/test_sessions.py`).
 - ✅ **Client-side video summaries** via SmolVLM2 (WebGPU/WASM) with a UI toggle to fall back to the legacy TF.js/TFLite worker classifiers.
+- ✅ **SmolVLM uploads persist inference-ready frames** alongside each segment in per-segment frame directories under `recordings/<session-id>/`.
 - ⚠️ **Not production-ready**—no auth/multi-user flows, inference is stubbed, and data lives only on the local machine; roadmap items below remain planned work.
 
 ## Running the Local API

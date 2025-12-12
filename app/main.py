@@ -8,6 +8,7 @@ from datetime import datetime
 import json
 from hashlib import blake2s
 from pathlib import Path
+import shutil
 from typing import Any
 from uuid import UUID
 
@@ -144,6 +145,7 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
         end_ts: datetime = Form(...),
         file: UploadFile = File(...),
         detections: str | None = Form(default=None),
+        frames: list[UploadFile] | None = File(default=None),
     ) -> dict[str, Any]:
         """Store an uploaded media segment on disk and persist its metadata."""
 
@@ -163,6 +165,41 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
         destination = session_dir / filename
 
         await asyncio.to_thread(destination.write_bytes, data)
+
+        frame_dir: Path | None = None
+        frame_image_paths: list[str] = []
+
+        def cleanup_frames_dir() -> None:
+            """Remove any partially written frame directory."""
+
+            if frame_dir and frame_dir.exists():
+                shutil.rmtree(frame_dir, ignore_errors=True)
+
+        frame_uploads = [item for item in frames or [] if item is not None]
+        if frame_uploads:
+            frame_dir = session_dir / f"{destination.stem}_frames"
+            try:
+                if frame_dir.exists():
+                    shutil.rmtree(frame_dir, ignore_errors=True)
+                frame_dir.mkdir(parents=True, exist_ok=True)
+                for frame_index, frame_file in enumerate(frame_uploads):
+                    contents = await frame_file.read()
+                    if not contents:
+                        continue
+                    frame_suffix = Path(frame_file.filename or "").suffix or ".png"
+                    frame_path = frame_dir / f"frame-{frame_index:04d}{frame_suffix}"
+                    await asyncio.to_thread(frame_path.write_bytes, contents)
+                    frame_image_paths.append(str(frame_path.relative_to(capture_root)))
+                if not frame_image_paths:
+                    frame_dir.rmdir()
+                    frame_dir = None
+            except Exception as exc:
+                destination.unlink(missing_ok=True)
+                cleanup_frames_dir()
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Failed to store frame images: {exc}",
+                ) from exc
 
         relative_uri = str(destination.relative_to(capture_root))
         checksum = blake2s(data).hexdigest()
@@ -197,18 +234,21 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
                 except Exception as exc:
                     # Roll back the segment write if detection payload is malformed.
                     destination.unlink(missing_ok=True)
+                    cleanup_frames_dir()
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=f"Invalid detections payload: {exc}",
                     ) from exc
         except SessionNotFoundError as exc:
             destination.unlink(missing_ok=True)
+            cleanup_frames_dir()
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Session not found",
             ) from exc
         except ValueError as exc:
             destination.unlink(missing_ok=True)
+            cleanup_frames_dir()
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=str(exc),
@@ -217,6 +257,8 @@ def create_app(session_store: SessionStore | None = None) -> FastAPI:
         response = jsonable_encoder(segment)
         if detections:
             response["detections"] = persisted_detections
+        if frame_image_paths:
+            response["frame_images"] = frame_image_paths
         return response
 
     @app.post("/segments/{segment_id}/detections", status_code=status.HTTP_201_CREATED)
