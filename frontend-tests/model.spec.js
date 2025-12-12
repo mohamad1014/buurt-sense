@@ -6,7 +6,7 @@ const RUN_MODELS = process.env.RUN_MODEL_TESTS === "1";
 
 const describeMaybe = RUN_MODELS ? test.describe : test.describe.skip;
 
-const APP_JS_PATH = path.join("app", "frontend", "static", "app.js");
+const APP_JS_PATH = path.join(process.cwd(), "app", "frontend", "static", "app.js");
 const APP_JS_CONTENT = fs.readFileSync(APP_JS_PATH, "utf-8");
 const STATIC_ROOT = path.join(process.cwd(), "app", "frontend", "static");
 
@@ -49,6 +49,14 @@ async function mountHarness(page) {
     await route.fallback();
   });
 
+  await page.route("**/sessions**", async (route) => {
+    await route.fulfill({
+      status: 200,
+      body: JSON.stringify({ revision: 0, sessions: [] }),
+      headers: { "Content-Type": "application/json" },
+    });
+  });
+
   const html = `
     <!doctype html>
     <html>
@@ -72,6 +80,7 @@ async function mountHarness(page) {
           window.BUURT_VIDEO_MODEL_URL = "https://huggingface.co/qualcomm/ResNet-Mixed-Convolution/resolve/main/ResNet-Mixed-Convolution_float.tflite?download=true";
           window.BUURT_YAMNET_CLASS_MAP_URL = "https://raw.githubusercontent.com/tensorflow/models/master/research/audioset/yamnet/yamnet_class_map.csv";
           window.BUURT_VIDEO_CLASS_MAP_URL = "/static/labels/kinetics400_label_map.txt";
+          window.BUURT_SKIP_SMOLVLM_PRELOAD = true;
         </script>
         <script>${APP_JS_CONTENT}</script>
       </body>
@@ -374,4 +383,300 @@ test("detection feed surfaces segment and latency metadata", async ({ page }) =>
   });
   expect(metaText).toContain("2.5s segment");
   expect(metaText).toContain("150ms inference");
+});
+
+test("SmolVLM strips chat template prefixes from summaries", async ({ page }) => {
+  await mountHarness(page);
+
+  const result = await page.evaluate(async () => {
+    globalThis.preloadSmolVlmModel = async () => true;
+    globalThis.extractFramesForWorker = async () => [
+      {
+        width: 1,
+        height: 1,
+        data: new Uint8ClampedArray([0, 0, 0, 255]),
+      },
+    ];
+    globalThis.encodeFramesToPngBlobs = async () => [];
+    globalThis.getSmolVlmWorkerClient = () => ({
+      preload: async () => true,
+      describeFrames: async () => ({
+        text: "User: ignore this Assistant: The camera pans across a living room.",
+        latencyMs: 1,
+        device: "stub",
+      }),
+    });
+
+    const blob = new Blob([new Uint8Array([0, 1, 2])], { type: "video/webm" });
+    const start = new Date();
+    const end = new Date(start.getTime() + 1000);
+    const response = await globalThis.getMobileDetections(blob, start, end, 0);
+    return response?.detections?.[0]?.class ?? null;
+  });
+
+  expect(result).toBe("The camera pans across a living room.");
+});
+
+test("SmolVLM defaults to a single frame for 256M model", async ({ page }) => {
+  await mountHarness(page);
+
+  const result = await page.evaluate(async () => {
+    globalThis.preloadSmolVlmModel = async () => true;
+    globalThis.encodeFramesToPngBlobs = async () => [];
+    globalThis.extractFramesForWorker = async () =>
+      Array.from({ length: 8 }, () => ({
+        width: 1,
+        height: 1,
+        data: new Uint8ClampedArray([0, 0, 0, 255]),
+      }));
+
+    globalThis.__smolFrameCounts = [];
+    globalThis.__smolPromptSeen = null;
+    globalThis.getSmolVlmWorkerClient = () => ({
+      preload: async () => true,
+      describeFrames: async (frames, options) => {
+        globalThis.__smolFrameCounts.push(Array.isArray(frames) ? frames.length : 0);
+        globalThis.__smolPromptSeen = options?.prompt ?? null;
+        return { text: "ok", latencyMs: 1, device: "stub" };
+      },
+    });
+
+    const blob = new Blob([new Uint8Array([0, 1, 2])], { type: "video/webm" });
+    const start = new Date();
+    const end = new Date(start.getTime() + 1000);
+    await globalThis.getMobileDetections(blob, start, end, 0);
+
+    return {
+      frameCounts: globalThis.__smolFrameCounts,
+      prompt: globalThis.__smolPromptSeen,
+    };
+  });
+
+  expect(result.frameCounts).toHaveLength(1);
+  expect(result.frameCounts[0]).toBe(1);
+  expect(result.prompt).toContain("This image is a frame from a video");
+});
+
+test("SmolVLM worker timeouts do not stall segment queue", async ({ page }) => {
+  await mountHarness(page);
+
+  const result = await page.evaluate(async () => {
+    globalThis.BUURT_SMOLVLM_WORKER_TIMEOUT_MS = 100;
+
+    globalThis.preloadSmolVlmModel = async () => true;
+    globalThis.extractFramesForWorker = async () => [
+      {
+        width: 1,
+        height: 1,
+        data: new Uint8ClampedArray([0, 0, 0, 255]),
+      },
+      {
+        width: 1,
+        height: 1,
+        data: new Uint8ClampedArray([0, 0, 0, 255]),
+      },
+    ];
+    globalThis.encodeFramesToPngBlobs = async () => [];
+    globalThis.getSmolVlmClient = () => ({
+      preload: () => Promise.resolve(),
+      describeVideoBlob: async (_blob, options = {}) => ({
+        text: `fallback-${options.imageLabel || "smolvlm"}`,
+        latencyMs: 1,
+        device: "main",
+        frameImages: [],
+      }),
+    });
+
+    globalThis.__fakeSmolVlmDescribeCount = 0;
+    class FakeWorker {
+      constructor(_url) {
+        this.onmessage = null;
+        this.onerror = null;
+        this.onmessageerror = null;
+      }
+
+      postMessage(message) {
+        const { id, type } = message || {};
+        const respond = (payload) => {
+          setTimeout(() => {
+            this.onmessage?.({ data: payload });
+          }, 0);
+        };
+
+        if (type === "INIT" || type === "PRELOAD") {
+          respond({ id, success: true, result: { ok: true, loaded: true } });
+          return;
+        }
+
+        if (type === "DESCRIBE_FRAMES") {
+          globalThis.__fakeSmolVlmDescribeCount += 1;
+          const callIndex = globalThis.__fakeSmolVlmDescribeCount;
+          if (callIndex === 2) {
+            // Simulate a hung worker request.
+            return;
+          }
+          respond({
+            id,
+            success: true,
+            result: {
+              text: `worker-summary-${callIndex}`,
+              latencyMs: 1,
+              device: "fake",
+            },
+          });
+          return;
+        }
+
+        respond({
+          id,
+          success: false,
+          error: `Unknown message type: ${type}`,
+        });
+      }
+
+      terminate() {}
+    }
+
+    globalThis.Worker = FakeWorker;
+
+    const blob = new Blob([new Uint8Array([0, 1, 2])], { type: "video/webm" });
+    const start = new Date();
+    const end = new Date(start.getTime() + 1000);
+
+    const pending = [
+      globalThis.getMobileDetections(blob, start, end, 0),
+      globalThis.getMobileDetections(blob, start, end, 1),
+      globalThis.getMobileDetections(blob, start, end, 2),
+    ];
+
+    const deadlineMs = 2000;
+    const winner = await Promise.race([
+      Promise.all(pending),
+      new Promise((resolve) => setTimeout(() => resolve(null), deadlineMs)),
+    ]);
+
+    if (!winner) {
+      return { ok: false, reason: "timeout" };
+    }
+
+    const summaries = winner.map(
+      (entry) => entry?.detections?.[0]?.class ?? null,
+    );
+
+    return { ok: true, summaries };
+  });
+
+  expect(result.ok).toBe(true);
+  expect(result.summaries).toHaveLength(3);
+  expect(result.summaries[0]).toMatch(/^worker-summary-/);
+  expect(result.summaries[1]).toBe("fallback-segment-0001-smolvlm");
+  expect(result.summaries[2]).toMatch(/^worker-summary-/);
+});
+
+test("SmolVLM uses live frames when segment decode fails", async ({ page }) => {
+  await mountHarness(page);
+  await page.context().grantPermissions(["camera", "microphone"], {
+    origin: "http://localhost",
+  });
+
+  await page.evaluate(async () => {
+    globalThis.__segmentUploads = [];
+    globalThis.__smolFramesSeen = [];
+    globalThis.__smolDescribeCalls = 0;
+
+    window.preloadSmolVlmModel = async () => true;
+    window.extractFramesForWorker = async () => [];
+    window.encodeFramesToPngBlobs = async () => [];
+
+    // Make the "live frame capture" deterministic across browser/device profiles by
+    // injecting synthetic frames into the capture context. This validates that the
+    // segment pipeline prefers provided frames over decode-based extraction without
+    // relying on requestAnimationFrame timing.
+    window.startSmolVlmLiveFrameCapture = async (context) => {
+      let stopped = false;
+      const interval = setInterval(() => {
+        if (stopped) {
+          return;
+        }
+        const frames = context?.smolVlmFrames;
+        if (!Array.isArray(frames) || frames.length >= 8) {
+          return;
+        }
+        frames.push({
+          width: 1,
+          height: 1,
+          data: new Uint8ClampedArray([0, 0, 0, 255]),
+        });
+      }, 25);
+      return {
+        stop() {
+          stopped = true;
+          clearInterval(interval);
+        },
+      };
+    };
+
+    window.uploadSegmentBlob = async (
+      _sessionId,
+      segmentIndex,
+      _startTs,
+      _endTs,
+      _blob,
+      detections,
+    ) => {
+      globalThis.__segmentUploads.push({ segmentIndex, detections });
+      return { ok: true };
+    };
+
+    window.getSmolVlmWorkerClient = () => ({
+      preload: async () => true,
+      describeFrames: async (frames) => {
+        const count = Array.isArray(frames) ? frames.length : 0;
+        globalThis.__smolFramesSeen.push(count);
+        globalThis.__smolDescribeCalls += 1;
+        if (!count) {
+          return {
+            text: null,
+            latencyMs: null,
+            device: "stub",
+            error: "no frames",
+          };
+        }
+        return {
+          text: `stub-summary-${globalThis.__smolDescribeCalls}`,
+          latencyMs: 1,
+          device: "stub",
+        };
+      },
+    });
+
+    await window.startMediaCapture({
+      id: "test-session",
+      config_snapshot: { segment_length_sec: 1 },
+    });
+  });
+
+  await page.waitForFunction(
+    () => (globalThis.__segmentUploads?.length || 0) >= 3,
+    null,
+    { timeout: 20_000 },
+  );
+
+  const result = await page.evaluate(async () => {
+    await window.stopMediaCapture();
+    const uploads = globalThis.__segmentUploads || [];
+    const frameCounts = globalThis.__smolFramesSeen || [];
+    const summaries = uploads.flatMap((entry) =>
+      Array.isArray(entry?.detections) ? entry.detections.map((det) => det?.class) : [],
+    );
+    return { uploads, frameCounts, summaries };
+  });
+
+  expect(result.uploads.length).toBeGreaterThanOrEqual(3);
+  expect(result.frameCounts.filter((count) => count > 0).length).toBeGreaterThanOrEqual(2);
+  expect(
+    result.summaries.filter(
+      (text) => typeof text === "string" && text.startsWith("stub-summary-"),
+    ).length,
+  ).toBeGreaterThanOrEqual(2);
 });

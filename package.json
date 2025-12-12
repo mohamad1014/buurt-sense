@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test:frontend": "npx playwright test frontend-tests"
+    "test:frontend": "npx playwright test --config frontend-tests/playwright.config.js"
   },
   "devDependencies": {
     "@playwright/test": "^1.48.2"
